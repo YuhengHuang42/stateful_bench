@@ -13,7 +13,6 @@
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-starter-parent</artifactId>
     <version>2.7.6</version>
-    <relativePath/>
   </parent>
   <profiles>
     <profile>
@@ -127,10 +126,6 @@
             </goals>
           </execution>
         </executions>
-        <configuration>
-          <finalName>session-service</finalName>
-          <classifier>sut</classifier>
-        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
