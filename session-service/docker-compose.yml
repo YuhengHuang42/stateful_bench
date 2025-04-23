@@ -3,9 +3,10 @@ services:
   web:
     build: .
     ports:
-      - "8080:8080"
+      - "18080:18080"
     environment:
       - JAVA_OPTS=-Dspring.data.mongodb.uri=mongodb://db:27017/session-service
+      - SERVER_PORT=18080
       # with sentry logging enabled (replace SENTRY_DSN with yours sentry dsn, one can find it in the SDK setup section in sentry's setting):
       # - JAVA_OPTS=-Dspring.data.mongodb.uri=mongodb://db:27017/session-service -Dsentry.dsn=SENTRY_DSN
       # with user/pass enabled:
