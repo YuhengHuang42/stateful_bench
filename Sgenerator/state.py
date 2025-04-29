@@ -1,6 +1,7 @@
 from typing import Callable, Any, Dict, List, Optional, Iterable
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import random
 
 @dataclass
 class Transition:
@@ -79,6 +80,14 @@ class Schema:
         pass
     
     @abstractmethod
+    def add_local_variable_using_state(self, state: Any, latest_call: int, updated: bool, created_by: str):
+        """
+        Add a local variable to the global schema using a state.
+        Wrapper of add_local_variable.
+        """
+        pass
+    
+    @abstractmethod
     def get_available_transitions(self, random_generator: Any):
         """
         Get the available transitions for the global schema.
@@ -93,13 +102,97 @@ class Schema:
         Return a transition object. Some side effects may be applied to the global schema in calling this function..
         """
         pass
+    
+    @abstractmethod
+    def craft_ifelse(self):
+        """
+        Craft an ifelse condition for the given trace.
+        This function will called by TraceGenerator and after this, two separate traces will be generated.
+        """
+        pass
+    
+    @abstractmethod
+    def align_initial_state(self):
+        """
+        Align the initial state with the parameter space.
+        Might not be needed for all schemas. Align the states where both 
+        implicit and local variables are generated randomly but they are not aligned.
+        """
+        pass
+    
+    def form_pair_transition(self, state, new_transition: str):
+        """
+        Form a pair transition for the given state and new transition.
+        """
+        if len(state.transitions) == 0:
+            last_transition = "NONE"
+        else:
+            last_transition = state.transitions[-1]["name"]
+        transition_pair = (last_transition, new_transition, )
+        return transition_pair
+    
+class RandomInitializer:
+    """
+    Initialize a random generator.
+    """
+    def __init__(self):
+        pass
+    
+    @abstractmethod
+    def random_generate_state(self):
+        """
+        Random generate a state.
+        """
+        pass
+    
 
 class TraceGenerator:
     """
     Generate a trace of the state changes.
+    Initialization --> transition selection --> trace generation
     """
-    def __init__(self, state_schema):
+    def __init__(self, 
+                 state_schema: Schema, 
+                 random_generator: Any, 
+                 config: Dict[str, Any],
+                 coverage_book: Dict[str, Any]):
+        """
+        config:
+            - init_local_state_num_range: the range of the number of local states to be initialized
+            - init_implicit_state_num_range: the range of the number of implicit states to be initialized
+            - random_generate_config: the config for the random generator (func random_generate_state) Dict [str, Any]
+        """
         self.state_schema = state_schema
+        self.random_generator = random_generator
+        self.trace = []
+        self.config = config
+        self.random_generate_config = config["random_generate_config"] if "random_generate_config" in config else {}
+        self.call_num = config["call_num"]
+        self.coverage_book = coverage_book
+        
+    def prepare_initial_state(self):
+        """
+        Prepare the initial state for the trace generation.
+        """
+        local_state_num = random.randint(self.config["init_local_state_num_range"][0], self.config["init_local_state_num_range"][1])
+        implicit_state_num = random.randint(self.config["init_implicit_state_num_range"][0], self.config["init_implicit_state_num_range"][1])
+        for i in range(implicit_state_num):
+            self.state_schema.add_implicit_variable(self.random_generator.random_generate_state(**self.random_generate_config), 0)
+        for i in range(local_state_num):
+            state = self.random_generator.random_generate_state(**self.random_generate_config)
+            self.state_schema.add_local_variable_using_state(state, latest_call=0)
+        self.state_schema.align_initial_state()
+        
+        
+    def generate_trace(self):
+        # 1. Two consecutive function calls with exact same parameters should be avoided.
+        # 2. The trace should allow control flow.
+        # 3. Increase pair coverage as much as possible.
+        for i in range(self.call_num):
+            available_transitions = self.state_schema.get_available_transitions(self.random_generator)
+            selection_to_coverage_map = dict()
+            for transition in available_transitions:
+                for idx, transition_info in enumerate(available_transitions[transition]):
+                    if transition_info["transition_pairs"] not in self.coverage_book:
+                        pass
 
-    def generate_trace(self) -> List[str]:
-        pass
