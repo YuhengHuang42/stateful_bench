@@ -1,5 +1,5 @@
 from typing import Callable, Any, Dict, List, Optional, Iterable
-from Sgenerator.state import State, Transition, Schema, RandomInitializer
+from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG
 from dataclasses import dataclass, field
 from enum import Enum
 import re
@@ -106,13 +106,13 @@ class SessionRandomInitializer(RandomInitializer):
                 break
             random_attempt += 1
         
-        return {
-            "id": None,
-            "source": source,
-            "type": type,
-            "checksum": "",
-            "data": data
-        }
+        return Session(
+            id=None,
+            source=source,
+            type=type,
+            checksum="",
+            data=data
+        )
         
     def random_generate_session_data(self, meta_field: str, field: str=None):
         assert meta_field in ["source", "type", "data"]
@@ -192,7 +192,12 @@ class SessionVariableSchema(Schema):
     def add_local_variable(self, local_variable: LocalVariable):
         self.local_states["variables"].append(local_variable)
     
-    def add_local_variable_using_state(self, state: Session, latest_call=0, updated=True, created_by="User-provided local variable"):
+    def clear_state(self):
+        self.local_states["variables"] = []
+        self.implicit_states["sessions"] = {}
+        self.implicit_states["latest_call"] = {}
+    
+    def add_local_variable_using_state(self, state: Session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG):
         local_variable = LocalVariable(value=state,
                                        updated=updated,
                                        latest_call=latest_call,
@@ -203,7 +208,10 @@ class SessionVariableSchema(Schema):
     
     def add_implicit_variable(self, session: Session, latest_call: int):
         if session.current_value["id"] is None:
-            current_max_id = max([int(i) for i in self.implicit_states["sessions"].keys()])
+            if len(self.implicit_states["sessions"]) == 0:
+                current_max_id = 1
+            else:
+                current_max_id = max([int(i) for i in self.implicit_states["sessions"].keys()])
             session.current_value["id"] = str(current_max_id + 1)
         self.implicit_states["sessions"][session.current_value["id"]] = session
         self.implicit_states["latest_call"][session.current_value["id"]] = latest_call
@@ -251,20 +259,42 @@ class SessionVariableSchema(Schema):
         
         if random.random() < 0.5:
             # Add a new local variable with id available.
-            chosen_implicit_variable = random.choice(list(self.implicit_states["sessions"].keys()))
+            chosen_implicit_variable_id = random.choice(list(self.implicit_states["sessions"].keys()))
+            chosen_implicit_variable = self.implicit_states["sessions"][chosen_implicit_variable_id]
             new_session = Session(id=chosen_implicit_variable.current_value["id"],
                                   source=chosen_implicit_variable.current_value["source"],
                                   type=chosen_implicit_variable.current_value["type"],
                                   data=None)
-            self.add_local_variable_using_state(new_session, latest_call=0, updated=True, created_by="User-provided local variable")
+            self.add_local_variable_using_state(new_session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG)
     
+
+    def obtain_if_condition(self):
+        """
+        Obtain the condition for the if-else transition.
+        """
+        for idx in range(len(self.local_states["variables"]), 0, -1):
+            local_variable = self.local_states["variables"][idx]
+            if local_variable.created_by == USER_FUNCTION_PARAM_FLAG:
+                meta_field = random.choice([key for key in local_variable.value.current_value.keys() \
+                    if key in ["source", "type", "data"] and local_variable.value.current_value[key] is not None])
+            else:
+                meta_field = "data"
+            if meta_field == "source" or meta_field == "type":
+                if_condition = (idx, meta_field, local_variable.value.current_value[meta_field])
+            elif meta_field == "data":
+                if_condition = (idx, "data", random.choice(list(local_variable.value.current_value["data"].keys())))
+            return if_condition
             
+                
+    
     def get_available_transitions(self, random_generator: SessionRandomInitializer) -> Dict[str, Transition]:
         available_transitions = {}
         duplicate_local_variable_map = {}
         self.get_latest_call_map()
         for transition in self.transitions:
             if transition.__name__ == "LocalEdit":
+                if len(self.local_states["variables"]) == 0:
+                    continue
                 latest_call = max(self.local_call_map.keys())
                 local_variable_1_idx = random.choice(self.local_call_map[latest_call])
                 local_variable = self.local_states["variables"][local_variable_1_idx]
@@ -370,10 +400,14 @@ class SessionVariableSchema(Schema):
                                     break
                         if transition.__name__ not in duplicate_local_variable_map:
                             duplicate_local_variable_map[transition.__name__] = set([])
+                        if local_variable.value.current_value['data'] is None:
+                            data_str = "None"
+                        else:
+                            data_str = sorted(local_variable.value.current_value['data'].items())
                         duplicate_str = (
                             f"source:{local_variable.value.current_value['source']}-"
                             f"type:{local_variable.value.current_value['type']}-"
-                            f"data:{sorted(local_variable.value.current_value['data'].items())}"
+                            f"data:{data_str}"
                         )
                         if duplicate_str in duplicate_local_variable_map[transition.__name__]:
                             satisfied = False
@@ -403,7 +437,7 @@ class SessionVariableSchema(Schema):
                 new_local_variable = LocalVariable(value=parameters["value"], 
                                                    updated=False, 
                                                    latest_call=calling_timestamp, 
-                                                   created_by=f"User-provided local variable")
+                                                   created_by=USER_FUNCTION_PARAM_FLAG)
                 self.add_local_variable(new_local_variable)
                 
         new_transition = transition(

@@ -2,6 +2,9 @@ from typing import Callable, Any, Dict, List, Optional, Iterable
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import random
+import numpy as np
+
+USER_FUNCTION_PARAM_FLAG = "User-provided local variable"
 
 @dataclass
 class Transition:
@@ -120,6 +123,12 @@ class Schema:
         """
         pass
     
+    def clear_state(self):
+        """
+        Clear the state of the schema.
+        """
+        pass
+    
     def form_pair_transition(self, state, new_transition: str):
         """
         Form a pair transition for the given state and new transition.
@@ -155,7 +164,7 @@ class TraceGenerator:
                  state_schema: Schema, 
                  random_generator: Any, 
                  config: Dict[str, Any],
-                 coverage_book: Dict[str, Any]):
+                 occurence_book: Dict[str, Any]):
         """
         config:
             - init_local_state_num_range: the range of the number of local states to be initialized
@@ -168,7 +177,8 @@ class TraceGenerator:
         self.config = config
         self.random_generate_config = config["random_generate_config"] if "random_generate_config" in config else {}
         self.call_num = config["call_num"]
-        self.coverage_book = coverage_book
+        self.occurence_book = occurence_book # pair -> occurence
+        self.this_trace_recorder = dict()
         
     def prepare_initial_state(self):
         """
@@ -185,14 +195,61 @@ class TraceGenerator:
         
         
     def generate_trace(self):
-        # 1. Two consecutive function calls with exact same parameters should be avoided.
-        # 2. The trace should allow control flow.
+        # 1. Two function calls with exact same parameters should be avoided.
         # 3. Increase pair coverage as much as possible.
+        # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
+        self.this_trace_recorder = dict()
         for i in range(self.call_num):
             available_transitions = self.state_schema.get_available_transitions(self.random_generator)
             selection_to_coverage_map = dict()
+            energy_map = dict()
+            # Compute coverage information
+            has_new_coverage = False
+            normalize_term = 0
             for transition in available_transitions:
+                if transition not in self.this_trace_recorder:
+                    self.this_trace_recorder[transition] = []
                 for idx, transition_info in enumerate(available_transitions[transition]):
-                    if transition_info["transition_pairs"] not in self.coverage_book:
-                        pass
-
+                    # If the transition with exactly the same parameters has been called, skip it.
+                    for parameters in self.this_trace_recorder[transition]:
+                        if parameters == transition_info["required_parameters"]:
+                            continue
+                    # Compute the coverage information
+                    transition_pairs = transition_info["transition_pairs"]
+                    uncovered_pairs = [
+                                    pair for pair in transition_pairs
+                                    if pair not in self.occurence_book
+                    ]
+                    if len(uncovered_pairs) > 0:
+                        has_new_coverage = True
+                        normalize_term += len(uncovered_pairs)
+                    selection_to_coverage_map[(transition, idx)] = [len(uncovered_pairs), uncovered_pairs, transition_pairs]
+            if has_new_coverage:
+                # If there is new coverage, the next selection should be made from the transitions with new coverage.
+                assert normalize_term > 0
+                for transition, idx in selection_to_coverage_map:
+                    if selection_to_coverage_map[(transition, idx)][0] > 0:
+                        energy_map[(transition, idx)] = selection_to_coverage_map[(transition, idx)][0] / normalize_term
+            else:
+                # If there is no new coverage, the next selection should be made from the transitions with lower occurence.
+                for transition, idx in selection_to_coverage_map:
+                    local_occurence = 0
+                    for pair in selection_to_coverage_map[(transition, idx)][2]:
+                        local_occurence += self.occurence_book[pair]
+                    ave_occurence = local_occurence / len(selection_to_coverage_map[(transition, idx)][2])
+                    energy_map[(transition, idx)] = ave_occurence
+                    normalize_term += ave_occurence
+                for transition, idx in selection_to_coverage_map:
+                    energy_map[(transition, idx)] = np.log(normalize_term / energy_map[(transition, idx)]) # IDF term in TF-IDF
+                    
+            candidates = [(key, energy_map[key]) for key in energy_map]
+            selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
+            for pair in selection_to_coverage_map[selected][2]:
+                self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
+            target_transition_info = available_transitions[selected[0]][selected[1]]
+            self.trace.append([selected[0], target_transition_info["required_parameters"]])
+        
+        return self.trace
+            
+                    
+                    
