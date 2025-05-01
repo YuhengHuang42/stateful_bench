@@ -1,4 +1,4 @@
-from typing import Callable, Any, Dict, List, Optional, Iterable, Tuple
+from typing import Callable, Any, Dict, List, Optional, Set, Tuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import random
@@ -84,10 +84,22 @@ class Schema:
         pass
     
     @abstractmethod
-    def get_available_transitions(self, random_generator: Any, current_call: int, max_call: int):
+    def get_available_transitions(self, 
+                                  random_generator: Any, 
+                                  current_call: int, 
+                                  max_call: int, 
+                                  duplicate_local_variable_map: Dict[str, Set[str]], 
+                                  previous_transition_info: Tuple):
         """
         Get the available transitions for the global schema.
         Return a dictionary of transition name to possible parameters.
+        ---
+        Args:
+            random_generator: a random generator
+            current_call: the current call number (1-indexed)
+            max_call: the maximum call number
+            duplicate_local_variable_map: a dictionary of duplicate local variable map. Transition name -> set of parameters.
+            previous_transition_info: the previous transition info. (transition name, parameters)
         """
         pass
     
@@ -119,6 +131,13 @@ class Schema:
     def clear_state(self):
         """
         Clear the state of the schema.
+        """
+        pass
+
+    def determine_whether_to_keep_pair(self, previous_transition_info: Tuple, current_transition_info: Tuple) -> bool:
+        """
+        Determine whether to keep the pair of transitions based on the already choosen one and the current candidate.
+        This function is used to filter out the transition pairs that seem to be stupid. (e.g., query the same variable twice in a row)
         """
         pass
     
@@ -193,11 +212,13 @@ class TraceGenerator:
         # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
         self.this_trace_recorder = dict()
         self.this_trace_duplicate_local_variable_map = dict()
+        previous_transition_info = None
         for i in range(self.call_num):
             available_transitions = self.state_schema.get_available_transitions(self.random_generator, 
                                                                                 i+1, 
                                                                                 self.call_num, 
-                                                                                self.this_trace_duplicate_local_variable_map)
+                                                                                copy.deepcopy(self.this_trace_duplicate_local_variable_map),
+                                                                                previous_transition_info)
             selection_to_coverage_map = dict()
             self.energy_map = dict()
             # Compute coverage information
@@ -243,20 +264,21 @@ class TraceGenerator:
             if len(candidates) == 1:
                 selected = candidates[0][0]
             elif len(candidates) == 0:
-                logger.warning(f"No available transitions for the {i}-th call. Terminate the trace generation.")
+                logger.warning(f"No available transitions for the {i+1}-th call. Terminate the trace generation.")
                 return self.trace
             else:
                 selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
             for pair in selection_to_coverage_map[selected][2]:
                 self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
             target_transition_info = available_transitions[selected[0]][selected[1]]
-            new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i, selected[0])
+            new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i+1, selected[0])
             if selected[0] not in self.this_trace_duplicate_local_variable_map:
                 self.this_trace_duplicate_local_variable_map[selected[0]] = set([])
             self.this_trace_duplicate_local_variable_map[selected[0]].add(str(sorted(target_transition_info["required_parameters"].items())))
             implicit, local = new_transition.get_effected_states(self.state_schema)
             new_transition.apply(implicit, local, self.state_schema)
             self.trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
+            previous_transition_info = (selected[0], target_transition_info["required_parameters"])
         
         return self.trace
             

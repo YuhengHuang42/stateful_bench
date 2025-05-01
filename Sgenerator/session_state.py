@@ -294,11 +294,49 @@ class SessionVariableSchema(Schema):
             
                 
     
+    def determine_whether_to_keep_pair(self, previous_transition_info: Tuple, current_transition_info: Tuple) -> bool:
+        """
+        Determine whether to keep the pair of transitions based on the already choosen one and the current candidate.
+        """
+        if previous_transition_info is None:
+            return True
+        if previous_transition_info[0] == current_transition_info[0]:
+            if previous_transition_info[0] == "LocalEdit":
+                prev_left = previous_transition_info[1]["local_variable_1_idx"]
+                current_left = current_transition_info[1]["local_variable_1_idx"]
+                prev_meta_field = previous_transition_info[1]["meta_field"]
+                current_meta_field = current_transition_info[1]["meta_field"]
+                if self.local_states["variables"][prev_left].value.current_value["id"] != self.local_states["variables"][current_left].value.current_value["id"]:
+                    return True
+                if prev_meta_field == current_meta_field:
+                    if prev_meta_field != "data":
+                        return False
+                    else:
+                        prev_field = previous_transition_info[1]["field"]
+                        current_field = current_transition_info[1]["field"]
+                        if prev_field == current_field:
+                            return False
+                        else:
+                            return True
+                else:
+                    return True
+        elif previous_transition_info[0] == "GetSessions" and (current_transition_info[0] == "GetSession" or current_transition_info[0] == "GetSessionByQuery"):
+            # Getsessions already contain information needed for GetSession and GetSessionByQuery.
+            # So we should not choose the pair of transitions.
+            if previous_transition_info[1]["source"] == current_transition_info[1]["source"] and \
+                previous_transition_info[1]["type"] == current_transition_info[1]["type"]:
+                return False
+            else:
+                return True
+        return True
+    
     def get_available_transitions(self, 
                                   random_generator: SessionRandomInitializer, 
                                   current_call: int, 
                                   max_call: int,
-                                  duplicate_local_variable_map: Dict[str, Set[str]] = {}) -> Dict[str, Transition]:
+                                  duplicate_local_variable_map,
+                                  previous_transition_info: Tuple = None,
+                                  ) -> Dict[str, Transition]:
         available_transitions = {}
         self.get_latest_call_map()
         for transition in self.transitions:
@@ -363,16 +401,17 @@ class SessionVariableSchema(Schema):
                         "field": field,
                         "value": value,
                     }
-                str_target_parameters = str(sorted(target_parameters.items()))
-                if str_target_parameters not in duplicate_local_variable_map[transition.__name__]:
-                    duplicate_local_variable_map[transition.__name__].add(str_target_parameters)
-                    available_transitions[transition.__name__].append({
-                        "required_parameters": target_parameters,
-                        "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
-                        "local_variable_idx": local_variable_1_idx,
-                        "transition_pairs": transition_pairs,
-                    })
+                if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
+                    str_target_parameters = str(sorted(target_parameters.items()))
+                    if str_target_parameters not in duplicate_local_variable_map[transition.__name__]:
+                        duplicate_local_variable_map[transition.__name__].add(str_target_parameters)
+                        available_transitions[transition.__name__].append({
+                            "required_parameters": target_parameters,
+                            "latest_call": local_variable.latest_call,
+                            "whether_updated": local_variable.updated,
+                            "local_variable_idx": local_variable_1_idx,
+                            "transition_pairs": transition_pairs,
+                        })
             elif transition.__name__ == "AddSession":
                 # AddSession should be done after LocalEdit.
                 for idx, local_variable in enumerate(self.local_states["variables"]):
@@ -388,16 +427,17 @@ class SessionVariableSchema(Schema):
                             "local_variable": local_variable,
                             "local_variable_idx": idx,
                         }
-                        str_target_parameters = str(sorted(target_parameters.items()))
-                        if str_target_parameters not in duplicate_local_variable_map[transition.__name__]:
-                            duplicate_local_variable_map[transition.__name__].add(str_target_parameters)
-                            available_transitions[transition.__name__].append({
-                                "required_parameters": target_parameters,
-                                "latest_call": local_variable.latest_call,
-                                "whether_updated": local_variable.updated,
-                                "local_variable_idx": idx,
-                                "transition_pairs": transition_pairs,
-                            })
+                        if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
+                            str_target_parameters = str(sorted(target_parameters.items()))
+                            if str_target_parameters not in duplicate_local_variable_map[transition.__name__]:
+                                duplicate_local_variable_map[transition.__name__].add(str_target_parameters)
+                                available_transitions[transition.__name__].append({
+                                    "required_parameters": target_parameters,
+                                    "latest_call": local_variable.latest_call,
+                                    "whether_updated": local_variable.updated,
+                                    "local_variable_idx": idx,
+                                    "transition_pairs": transition_pairs,
+                                })
                     else:
                         continue
             else:
@@ -408,6 +448,9 @@ class SessionVariableSchema(Schema):
                         satisfied = True
                         # Avoid empty query return.
                         if transition.__name__ in QUERY_SET:
+                            if len(local_variable.value.transitions) > 0 and local_variable.value.transitions[-1]['name'] in QUERY_SET:
+                                # Already queried. Skip.
+                                continue
                             has_implicit_variable = False
                             for key in self.implicit_states["sessions"]:
                                 if self.implicit_states["sessions"][key].exist is False:
@@ -420,6 +463,12 @@ class SessionVariableSchema(Schema):
                                             break
                                         else:
                                             continue
+                                    elif transition.__name__ == "GetSessionByQuery":
+                                        if local_variable.value.current_value["data"] is None:
+                                            continue
+                                        else:
+                                            has_implicit_variable = True
+                                            break
                                     else:
                                         has_implicit_variable = True
                                         break
@@ -427,47 +476,48 @@ class SessionVariableSchema(Schema):
                                 satisfied = False
                                 break
                         if satisfied:
-                            for parameter in required_parameters:
-                                if parameter not in local_variable.value.current_value or local_variable.value.current_value[parameter] is None:
-                                    satisfied = False
-                                    break
-                        #if local_variable.value.current_value['data'] is None:
-                        #    data_str = "None"
-                        #else:
-                        #    data_str = sorted(local_variable.value.current_value['data'].items())
-                        #duplicate_str = (
-                        #    f"source:{local_variable.value.current_value['source']}-"
-                        #    f"type:{local_variable.value.current_value['type']}-"
-                        #    f"data:{data_str}"
-                        #)
+                            target_parameters = {}
+                            if transition.__name__ == "GetSessionByQuery":
+                                field = random.choice(list(local_variable.value.current_value["data"].keys()))
+                                target_parameters = {
+                                    "source": local_variable.value.current_value["source"],
+                                    "type": local_variable.value.current_value["type"],
+                                    "field": field,
+                                    "value": local_variable.value.current_value["data"][field],
+                                }
+                            else:
+                                for parameter in required_parameters:
+                                    if parameter not in local_variable.value.current_value or local_variable.value.current_value[parameter] is None:
+                                        satisfied = False
+                                        break
+                                    target_parameters[parameter] = local_variable.value.current_value[parameter]
+                        
                         if satisfied:
-                            duplicate_str = {parameter: local_variable.value.current_value[parameter] for parameter in required_parameters}
-                            duplicate_str = str(sorted(duplicate_str))
+                            duplicate_str = str(sorted(target_parameters))
                             if duplicate_str in duplicate_local_variable_map[transition.__name__]:
                                 satisfied = False
-                            else:
-                                duplicate_local_variable_map[transition.__name__].add(duplicate_str)
                             
                         if satisfied:
-                            if current_call < max_call:
+                            if current_call < max_call and transition.__name__ == "DeleteSession":
                                 # When this is not the last call, we should not delete the only local variable.
                                 # Because it can sometimes cause the termination of the trace generation.
                                 exist_local_variable = [variable for variable in self.local_states["variables"] if variable.exist]
                                 exist_local_variable = set([i.value.current_value["id"] for i in exist_local_variable if i.value.current_value["id"] is not None])
-                                if len(exist_local_variable) == 1 and transition.__name__ == "DeleteSession":
+                                if len(exist_local_variable) == 1:
                                     satisfied = False
                                     break
                             if transition.__name__ not in available_transitions:
                                 available_transitions[transition.__name__] = []
                             transition_pairs = [self.form_pair_transition(local_variable.value, transition.__name__)]
-                            available_transitions[transition.__name__].append({
-                                "required_parameters": {parameter: local_variable.value.current_value[parameter] 
-                                                        for parameter in required_parameters},
-                                "latest_call": local_variable.latest_call,
-                                "whether_updated": local_variable.updated,
-                                "local_variable_idx": idx,
-                                "transition_pairs": transition_pairs,
-                            })
+                            if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
+                                available_transitions[transition.__name__].append({
+                                    "required_parameters": target_parameters,
+                                    "latest_call": local_variable.latest_call,
+                                    "whether_updated": local_variable.updated,
+                                    "local_variable_idx": idx,
+                                    "transition_pairs": transition_pairs,
+                                })
+                                duplicate_local_variable_map[transition.__name__].add(duplicate_str)
         return available_transitions
     
     def craft_transition(self, parameters, calling_timestamp, transition):
@@ -596,7 +646,7 @@ class AddSession(Transition):
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
-        new_session = Session(id=implicit_states[0], 
+        new_session = Session(id=str(implicit_states[0]), 
                               source=self.parameters["source"], 
                               type=self.parameters["type"], 
                               data=self.parameters["data"],
