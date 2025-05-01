@@ -1,9 +1,10 @@
-from typing import Callable, Any, Dict, List, Optional, Iterable
+from typing import Callable, Any, Dict, List, Optional, Iterable, Tuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import random
 import numpy as np
-
+from loguru import logger
+import copy
 USER_FUNCTION_PARAM_FLAG = "User-provided local variable"
 
 @dataclass
@@ -17,14 +18,6 @@ class Transition:
     name: str
     parameters: Dict[str, Any]
     func: Callable[[Any, Dict[str, Any]], Any]
-    
-    
-    def apply(self, effected_states: List[str], variable_schema) -> Any:
-        """
-        Apply this transition and record the effect on the variable schema.
-        """
-        pass
-        #return self.func(value, self.parameters)
 
     def check(self, name: str, parameters: Dict[str, Any]) -> bool:
         """
@@ -38,7 +31,7 @@ class Transition:
         return True
     
     @abstractmethod
-    def get_effected_states(self, variable_schema) -> List[str]:
+    def get_effected_states(self, variable_schema) -> Tuple[List[str], List[str]]:
         """
         Get the states that are affected by this transition.
         Return a list of state identifiers.
@@ -46,7 +39,7 @@ class Transition:
         pass
     
     @abstractmethod
-    def apply(self, states, variable_schema):
+    def apply(self, implicit_states: List[str], local_states: List[str], variable_schema):
         """Apply the transition to the list of state. Return the list of updated states."""
         pass
 
@@ -91,7 +84,7 @@ class Schema:
         pass
     
     @abstractmethod
-    def get_available_transitions(self, random_generator: Any):
+    def get_available_transitions(self, random_generator: Any, current_call: int, max_call: int):
         """
         Get the available transitions for the global schema.
         Return a dictionary of transition name to possible parameters.
@@ -99,7 +92,7 @@ class Schema:
         pass
     
     @abstractmethod
-    def craft_transition(self, parameters: Any, calling_timestamp: int, transition: Any):
+    def craft_transition(self, parameters: Any, calling_timestamp: int, transition: str):
         """
         Craft a transition for the global schema.
         Return a transition object. Some side effects may be applied to the global schema in calling this function..
@@ -167,8 +160,8 @@ class TraceGenerator:
                  occurence_book: Dict[str, Any]):
         """
         config:
-            - init_local_state_num_range: the range of the number of local states to be initialized
-            - init_implicit_state_num_range: the range of the number of implicit states to be initialized
+            - init_local_state_num_range: the range of the number of local states to be initialized. [min, max]
+            - init_implicit_state_num_range: the range of the number of implicit states to be initialized. [min, max]
             - random_generate_config: the config for the random generator (func random_generate_state) Dict [str, Any]
         """
         self.state_schema = state_schema
@@ -199,10 +192,14 @@ class TraceGenerator:
         # 3. Increase pair coverage as much as possible.
         # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
         self.this_trace_recorder = dict()
+        self.this_trace_duplicate_local_variable_map = dict()
         for i in range(self.call_num):
-            available_transitions = self.state_schema.get_available_transitions(self.random_generator)
+            available_transitions = self.state_schema.get_available_transitions(self.random_generator, 
+                                                                                i+1, 
+                                                                                self.call_num, 
+                                                                                self.this_trace_duplicate_local_variable_map)
             selection_to_coverage_map = dict()
-            energy_map = dict()
+            self.energy_map = dict()
             # Compute coverage information
             has_new_coverage = False
             normalize_term = 0
@@ -229,7 +226,7 @@ class TraceGenerator:
                 assert normalize_term > 0
                 for transition, idx in selection_to_coverage_map:
                     if selection_to_coverage_map[(transition, idx)][0] > 0:
-                        energy_map[(transition, idx)] = selection_to_coverage_map[(transition, idx)][0] / normalize_term
+                        self.energy_map[(transition, idx)] = selection_to_coverage_map[(transition, idx)][0] / normalize_term
             else:
                 # If there is no new coverage, the next selection should be made from the transitions with lower occurence.
                 for transition, idx in selection_to_coverage_map:
@@ -237,17 +234,29 @@ class TraceGenerator:
                     for pair in selection_to_coverage_map[(transition, idx)][2]:
                         local_occurence += self.occurence_book[pair]
                     ave_occurence = local_occurence / len(selection_to_coverage_map[(transition, idx)][2])
-                    energy_map[(transition, idx)] = ave_occurence
+                    self.energy_map[(transition, idx)] = ave_occurence
                     normalize_term += ave_occurence
                 for transition, idx in selection_to_coverage_map:
-                    energy_map[(transition, idx)] = np.log(normalize_term / energy_map[(transition, idx)]) # IDF term in TF-IDF
+                    self.energy_map[(transition, idx)] = np.log(normalize_term / self.energy_map[(transition, idx)]) # IDF term in TF-IDF
                     
-            candidates = [(key, energy_map[key]) for key in energy_map]
-            selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
+            candidates = [(key, self.energy_map[key]) for key in self.energy_map]
+            if len(candidates) == 1:
+                selected = candidates[0][0]
+            elif len(candidates) == 0:
+                logger.warning(f"No available transitions for the {i}-th call. Terminate the trace generation.")
+                return self.trace
+            else:
+                selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
             for pair in selection_to_coverage_map[selected][2]:
                 self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
             target_transition_info = available_transitions[selected[0]][selected[1]]
-            self.trace.append([selected[0], target_transition_info["required_parameters"]])
+            new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i, selected[0])
+            if selected[0] not in self.this_trace_duplicate_local_variable_map:
+                self.this_trace_duplicate_local_variable_map[selected[0]] = set([])
+            self.this_trace_duplicate_local_variable_map[selected[0]].add(str(sorted(target_transition_info["required_parameters"].items())))
+            implicit, local = new_transition.get_effected_states(self.state_schema)
+            new_transition.apply(implicit, local, self.state_schema)
+            self.trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
         
         return self.trace
             
