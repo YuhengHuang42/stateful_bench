@@ -151,6 +151,20 @@ class Schema:
             last_transition = state.transitions[-1]["name"]
         transition_pair = (last_transition, new_transition, )
         return transition_pair
+
+    def transform_parameters_to_str(self, parameters: Dict[str, Any]) -> str:
+        """
+        Transform the parameters to a string.
+        """
+        def sorted_deep(obj):
+            if isinstance(obj, dict):
+                return {k: sorted_deep(v) for k, v in sorted(obj.items())}
+            elif isinstance(obj, list):
+                return [sorted_deep(elem) for elem in obj]
+            return obj
+        
+        normalized = sorted_deep(parameters)
+        return str(sorted(normalized.items()))
     
 class RandomInitializer:
     """
@@ -185,12 +199,9 @@ class TraceGenerator:
         """
         self.state_schema = state_schema
         self.random_generator = random_generator
-        self.trace = []
         self.config = config
         self.random_generate_config = config["random_generate_config"] if "random_generate_config" in config else {}
-        self.call_num = config["call_num"]
         self.occurence_book = occurence_book # pair -> occurence
-        self.this_trace_recorder = dict()
         
     def prepare_initial_state(self):
         """
@@ -206,30 +217,29 @@ class TraceGenerator:
         self.state_schema.align_initial_state()
         
         
-    def generate_trace(self):
+    def generate_trace(self, call_num, this_trace_recorder=dict(), this_trace_duplicate_local_variable_map=dict()):
         # 1. Two function calls with exact same parameters should be avoided.
-        # 3. Increase pair coverage as much as possible.
+        # 2. Increase pair coverage as much as possible.
         # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
-        self.this_trace_recorder = dict()
-        self.this_trace_duplicate_local_variable_map = dict()
         previous_transition_info = None
-        for i in range(self.call_num):
+        trace = []
+        for i in range(call_num):
             available_transitions = self.state_schema.get_available_transitions(self.random_generator, 
                                                                                 i+1, 
-                                                                                self.call_num, 
-                                                                                copy.deepcopy(self.this_trace_duplicate_local_variable_map),
+                                                                                call_num, 
+                                                                                copy.deepcopy(this_trace_duplicate_local_variable_map),
                                                                                 previous_transition_info)
             selection_to_coverage_map = dict()
-            self.energy_map = dict()
+            energy_map = dict()
             # Compute coverage information
             has_new_coverage = False
             normalize_term = 0
             for transition in available_transitions:
-                if transition not in self.this_trace_recorder:
-                    self.this_trace_recorder[transition] = []
+                if transition not in this_trace_recorder:
+                    this_trace_recorder[transition] = []
                 for idx, transition_info in enumerate(available_transitions[transition]):
                     # If the transition with exactly the same parameters has been called, skip it.
-                    for parameters in self.this_trace_recorder[transition]:
+                    for parameters in this_trace_recorder[transition]:
                         if parameters == transition_info["required_parameters"]:
                             continue
                     # Compute the coverage information
@@ -247,7 +257,7 @@ class TraceGenerator:
                 assert normalize_term > 0
                 for transition, idx in selection_to_coverage_map:
                     if selection_to_coverage_map[(transition, idx)][0] > 0:
-                        self.energy_map[(transition, idx)] = selection_to_coverage_map[(transition, idx)][0] / normalize_term
+                        energy_map[(transition, idx)] = selection_to_coverage_map[(transition, idx)][0] / normalize_term
             else:
                 # If there is no new coverage, the next selection should be made from the transitions with lower occurence.
                 for transition, idx in selection_to_coverage_map:
@@ -255,32 +265,32 @@ class TraceGenerator:
                     for pair in selection_to_coverage_map[(transition, idx)][2]:
                         local_occurence += self.occurence_book[pair]
                     ave_occurence = local_occurence / len(selection_to_coverage_map[(transition, idx)][2])
-                    self.energy_map[(transition, idx)] = ave_occurence
+                    energy_map[(transition, idx)] = ave_occurence
                     normalize_term += ave_occurence
                 for transition, idx in selection_to_coverage_map:
-                    self.energy_map[(transition, idx)] = np.log(normalize_term / self.energy_map[(transition, idx)]) # IDF term in TF-IDF
+                    energy_map[(transition, idx)] = np.log(normalize_term / energy_map[(transition, idx)]) # IDF term in TF-IDF
                     
-            candidates = [(key, self.energy_map[key]) for key in self.energy_map]
+            candidates = [(key, energy_map[key]) for key in energy_map]
             if len(candidates) == 1:
                 selected = candidates[0][0]
             elif len(candidates) == 0:
                 logger.warning(f"No available transitions for the {i+1}-th call. Terminate the trace generation.")
-                return self.trace
+                return trace, this_trace_recorder, this_trace_duplicate_local_variable_map
             else:
                 selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
             for pair in selection_to_coverage_map[selected][2]:
                 self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
             target_transition_info = available_transitions[selected[0]][selected[1]]
             new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i+1, selected[0])
-            if selected[0] not in self.this_trace_duplicate_local_variable_map:
-                self.this_trace_duplicate_local_variable_map[selected[0]] = set([])
-            self.this_trace_duplicate_local_variable_map[selected[0]].add(str(sorted(target_transition_info["required_parameters"].items())))
+            if selected[0] not in this_trace_duplicate_local_variable_map:
+                this_trace_duplicate_local_variable_map[selected[0]] = set([])
+            this_trace_duplicate_local_variable_map[selected[0]].add(self.state_schema.transform_parameters_to_str(target_transition_info["required_parameters"]))
             implicit, local = new_transition.get_effected_states(self.state_schema)
             new_transition.apply(implicit, local, self.state_schema)
-            self.trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
+            trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
             previous_transition_info = (selected[0], target_transition_info["required_parameters"])
         
-        return self.trace
+        return trace, this_trace_recorder, this_trace_duplicate_local_variable_map
             
                     
                     

@@ -238,10 +238,13 @@ class SessionVariableSchema(Schema):
         Align the initial state with the parameter space.
         """
         replace_local_variable = False
-        if random.random() < 0.5:
+        # Maximum number of local variables to be replaced is 2.
+        replace_local_variable_num = random.randint(0, min(2, len(self.local_states["variables"])))
+        if replace_local_variable_num > 0:
             replace_local_variable = True
-            drop_idx = random.choice(range(len(self.local_states["variables"])))
-            self.local_states["variables"].pop(drop_idx)
+            drop_idx = random.sample(range(len(self.local_states["variables"])), replace_local_variable_num)
+            for idx in sorted(drop_idx, reverse=True):
+                self.local_states["variables"].pop(idx)
         if len(self.local_states["variables"]) != 0:
             implicit_set = set([])
             for key in self.implicit_states["sessions"]:
@@ -266,20 +269,21 @@ class SessionVariableSchema(Schema):
         
         if replace_local_variable:
             # Add a new local variable with id available.
-            chosen_implicit_variable_id = random.choice(list(self.implicit_states["sessions"].keys()))
-            chosen_implicit_variable = self.implicit_states["sessions"][chosen_implicit_variable_id]
-            new_session = Session(id=chosen_implicit_variable.current_value["id"],
-                                  source=chosen_implicit_variable.current_value["source"],
-                                  type=chosen_implicit_variable.current_value["type"],
-                                  data=None)
-            self.add_local_variable_using_state(new_session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG)
+            chosen_implicit_variable = random.sample(list(self.implicit_states["sessions"].keys()), replace_local_variable_num)
+            for i in chosen_implicit_variable:
+                chosen_implicit_variable = self.implicit_states["sessions"][i]
+                new_session = Session(id=chosen_implicit_variable.current_value["id"],
+                                    source=chosen_implicit_variable.current_value["source"],
+                                    type=chosen_implicit_variable.current_value["type"],
+                                    data=None)
+                self.add_local_variable_using_state(new_session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG)
     
 
     def obtain_if_condition(self):
         """
         Obtain the condition for the if-else transition.
         """
-        for idx in range(len(self.local_states["variables"]), 0, -1):
+        for idx in range(len(self.local_states["variables"])-1, -1, -1):
             local_variable = self.local_states["variables"][idx]
             if local_variable.created_by == USER_FUNCTION_PARAM_FLAG:
                 meta_field = random.choice([key for key in local_variable.value.current_value.keys() \
@@ -287,9 +291,10 @@ class SessionVariableSchema(Schema):
             else:
                 meta_field = "data"
             if meta_field == "source" or meta_field == "type":
-                if_condition = (idx, meta_field, local_variable.value.current_value[meta_field])
+                if_condition = (idx, (meta_field, ), local_variable.value.current_value[meta_field])
             elif meta_field == "data":
-                if_condition = (idx, "data", random.choice(list(local_variable.value.current_value["data"].keys())))
+                field = random.choice(list(local_variable.value.current_value["data"].keys()))  
+                if_condition = (idx, ("data", field), local_variable.value.current_value["data"][field])
             return if_condition
             
                 
@@ -402,9 +407,9 @@ class SessionVariableSchema(Schema):
                         "value": value,
                     }
                 if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
-                    str_target_parameters = str(sorted(target_parameters.items()))
-                    if str_target_parameters not in duplicate_local_variable_map[transition.__name__]:
-                        duplicate_local_variable_map[transition.__name__].add(str_target_parameters)
+                    duplicate_str = self.transform_parameters_to_str(target_parameters)
+                    if duplicate_str not in duplicate_local_variable_map[transition.__name__]:
+                        duplicate_local_variable_map[transition.__name__].add(duplicate_str)
                         available_transitions[transition.__name__].append({
                             "required_parameters": target_parameters,
                             "latest_call": local_variable.latest_call,
@@ -428,9 +433,9 @@ class SessionVariableSchema(Schema):
                             "local_variable_idx": idx,
                         }
                         if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
-                            str_target_parameters = str(sorted(target_parameters.items()))
-                            if str_target_parameters not in duplicate_local_variable_map[transition.__name__]:
-                                duplicate_local_variable_map[transition.__name__].add(str_target_parameters)
+                            duplicate_str = self.transform_parameters_to_str(target_parameters)
+                            if duplicate_str not in duplicate_local_variable_map[transition.__name__]:
+                                duplicate_local_variable_map[transition.__name__].add(duplicate_str)
                                 available_transitions[transition.__name__].append({
                                     "required_parameters": target_parameters,
                                     "latest_call": local_variable.latest_call,
@@ -493,7 +498,7 @@ class SessionVariableSchema(Schema):
                                     target_parameters[parameter] = local_variable.value.current_value[parameter]
                         
                         if satisfied:
-                            duplicate_str = str(sorted(target_parameters))
+                            duplicate_str = self.transform_parameters_to_str(target_parameters)
                             if duplicate_str in duplicate_local_variable_map[transition.__name__]:
                                 satisfied = False
                             
