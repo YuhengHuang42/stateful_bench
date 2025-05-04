@@ -5,7 +5,8 @@ import random
 import numpy as np
 from loguru import logger
 import copy
-USER_FUNCTION_PARAM_FLAG = "User-provided local variable"
+USER_FUNCTION_PARAM_FLAG = "User-variable"
+RESPONSE_VARIABLE_TEMP = "response_{}"
 
 @dataclass
 class Transition:
@@ -17,7 +18,8 @@ class Transition:
     """
     name: str
     parameters: Dict[str, Any]
-    func: Callable[[Any, Dict[str, Any]], Any]
+    producer = "None" # The input parameter source of this transition.
+    func: Callable[[Any, Dict[str, Any]], Any] = None
 
     def check(self, name: str, parameters: Dict[str, Any]) -> bool:
         """
@@ -223,6 +225,7 @@ class TraceGenerator:
         # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
         previous_transition_info = None
         trace = []
+        trace_str = []
         for i in range(call_num):
             available_transitions = self.state_schema.get_available_transitions(self.random_generator, 
                                                                                 i+1, 
@@ -281,16 +284,26 @@ class TraceGenerator:
             for pair in selection_to_coverage_map[selected][2]:
                 self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
             target_transition_info = available_transitions[selected[0]][selected[1]]
-            new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i+1, selected[0])
+            producer = target_transition_info["producer_variable_idx"]
+            if producer is not None:
+                producer = copy.deepcopy(self.state_schema.local_states["variables"][producer])
+            else:
+                producer = None
+            #producer_info = f"FROM local_variable_idx: {producer}, created_by: {self.state_schema.local_states['variables'][producer].created_by}"
+            new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i+1, selected[0], producer)
             if selected[0] not in this_trace_duplicate_local_variable_map:
                 this_trace_duplicate_local_variable_map[selected[0]] = set([])
             this_trace_duplicate_local_variable_map[selected[0]].add(self.state_schema.transform_parameters_to_str(target_transition_info["required_parameters"]))
             implicit, local = new_transition.get_effected_states(self.state_schema)
             new_transition.apply(implicit, local, self.state_schema)
             trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
+            try:
+                trace_str.append(str(new_transition))
+            except:
+                trace_str.append(f"Error: {new_transition}")
             previous_transition_info = (selected[0], target_transition_info["required_parameters"])
         
-        return trace, this_trace_recorder, this_trace_duplicate_local_variable_map
+        return (trace, trace_str), this_trace_recorder, this_trace_duplicate_local_variable_map
             
                     
                     

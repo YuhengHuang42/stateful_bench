@@ -1,5 +1,4 @@
 from typing import Callable, Any, Dict, List, Optional, Tuple, Set
-from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG
 from dataclasses import dataclass, field
 from enum import Enum
 import re
@@ -10,6 +9,9 @@ from loguru import logger
 from collections import defaultdict
 from collections import OrderedDict
 
+from Sgenerator.utils import get_nested_path_string
+from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
+
 class SessionType(str, Enum):
     MAIN_SESSION = "main_session"
     VIRTUAL_STUDY = "virtual_study"
@@ -19,6 +21,9 @@ class SessionType(str, Enum):
     CUSTOM_DATA = "custom_data"
     GENOMIC_CHART = "genomic_chart"
     CUSTOM_GENE_LIST = "custom_gene_list"
+
+    def __str__(self):
+        return self.value
 
 QUERY_SET = set(["GetSession", "GetSessions", "GetSessionByQuery"])
 
@@ -161,6 +166,7 @@ class Session(State):
 @dataclass
 class LocalVariable:
     value: Any
+    name: str
     # whether the local variable is updated before the implicit state is actually updated. E.g., those local 
     # varibales that are updated by the local edit transition but not submitted to the backend database yet.
     updated: bool = False  
@@ -199,12 +205,14 @@ class SessionVariableSchema(Schema):
         self.implicit_states["latest_call"] = {}
     
     def add_local_variable_using_state(self, state: Session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG):
-        local_variable = LocalVariable(value=state,
-                                       updated=updated,
-                                       latest_call=latest_call,
-                                       exist=True,
-                                       created_by=created_by
-                                       )
+        local_variable = LocalVariable(
+            name=created_by+f"_{len(self.local_states['variables'])}",
+            value=state,
+            updated=updated,
+            latest_call=latest_call,
+            exist=True,
+            created_by=created_by
+        )
         self.local_states["variables"].append(local_variable)
     
     def add_implicit_variable(self, session: Session, latest_call: int):
@@ -414,7 +422,7 @@ class SessionVariableSchema(Schema):
                             "required_parameters": target_parameters,
                             "latest_call": local_variable.latest_call,
                             "whether_updated": local_variable.updated,
-                            "local_variable_idx": local_variable_1_idx,
+                            "producer_variable_idx": local_variable_2_idx,
                             "transition_pairs": transition_pairs,
                         })
             elif transition.__name__ == "AddSession":
@@ -440,7 +448,7 @@ class SessionVariableSchema(Schema):
                                     "required_parameters": target_parameters,
                                     "latest_call": local_variable.latest_call,
                                     "whether_updated": local_variable.updated,
-                                    "local_variable_idx": idx,
+                                    "producer_variable_idx": idx,
                                     "transition_pairs": transition_pairs,
                                 })
                     else:
@@ -519,13 +527,13 @@ class SessionVariableSchema(Schema):
                                     "required_parameters": target_parameters,
                                     "latest_call": local_variable.latest_call,
                                     "whether_updated": local_variable.updated,
-                                    "local_variable_idx": idx,
+                                    "producer_variable_idx": idx,
                                     "transition_pairs": transition_pairs,
                                 })
                                 duplicate_local_variable_map[transition.__name__].add(duplicate_str)
         return available_transitions
     
-    def craft_transition(self, parameters, calling_timestamp, transition):
+    def craft_transition(self, parameters, calling_timestamp, transition, producer="None"):
         if transition == "LocalEdit":
             if parameters["local_variable_2_idx"] is None:
                 # This local variable is generaed randomly in the get_available_transitions function.
@@ -539,17 +547,23 @@ class SessionVariableSchema(Schema):
                     new_local_session.initial_value[parameters["meta_field"]] = parameters["value"]
                     new_local_session.current_value[parameters["meta_field"]] = parameters["value"]
                 
-                new_local_variable = LocalVariable(value=new_local_session, 
-                                                   updated=False,  # Because it is already used to edit another local variable.
-                                                   latest_call=calling_timestamp, 
-                                                   created_by=USER_FUNCTION_PARAM_FLAG)
+                new_local_variable = LocalVariable(
+                    name=USER_FUNCTION_PARAM_FLAG+f"_{len(self.local_states['variables'])}",
+                    value=new_local_session, 
+                    updated=False,  # Because it is already used to edit another local variable.
+                    latest_call=calling_timestamp, 
+                    created_by=USER_FUNCTION_PARAM_FLAG
+                )
                 self.add_local_variable(new_local_variable)
+                parameters["local_variable_2_idx"] = len(self.local_states["variables"]) - 1
+                producer = copy.deepcopy(self.local_states["variables"][parameters["local_variable_2_idx"]])
         
         transition_class = globals()[transition]
         new_transition = transition_class(
             parameters=parameters, 
             calling_timestamp=calling_timestamp
             )
+        new_transition.producer = producer
         return new_transition
     
 
@@ -572,7 +586,17 @@ class GetSessions(Transition):
         self.calling_timestamp = calling_timestamp
         
     def __str__(self):
-        return f"GET {self.parameters['type']} sessions from {self.parameters['source']}"
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        url = "[BASE_URL]/api/sessions/{source}/{type}"
+        target_transition = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + f" = request.get(url)"
+        return (
+            f"source = {self.producer.name}['source']\n"
+            f"type = {self.producer.name}['type']\n"
+            f"url = f'{url}'\n"
+            f"{target_transition}"
+            f"    # FROM {self.producer.name}. source={source}, type={type}"
+        )
     
     @staticmethod
     def get_required_parameters() -> List[str]:
@@ -590,7 +614,7 @@ class GetSessions(Transition):
         return result, None
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
-        for state_id in implicit_states:
+        for idx, state_id in enumerate(implicit_states):
             state = variable_schema.implicit_states["sessions"][state_id]
             state.transitions.append({
                 "name": self.name,
@@ -598,10 +622,13 @@ class GetSessions(Transition):
             })
             variable_schema.implicit_states["latest_call"][state_id] = self.calling_timestamp
             
-            local_variable = LocalVariable(value=copy.deepcopy(state), 
-                                           updated=False, 
-                                           latest_call=self.calling_timestamp, 
-                                           created_by=f"{self.name}@{self.calling_timestamp}")
+            local_variable = LocalVariable(
+                name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + f"[{idx}]",
+                value=copy.deepcopy(state), 
+                updated=False, 
+                latest_call=self.calling_timestamp, 
+                created_by=f"{self.name}@{self.calling_timestamp}"
+            )
             variable_schema.add_local_variable(local_variable)
 
         return variable_schema
@@ -635,6 +662,7 @@ class AddSession(Transition):
         }
         super().__init__(name="AddSession", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
+        self.string_parameters = None
         
     @staticmethod
     def get_required_parameters() -> List[str]:
@@ -647,7 +675,22 @@ class AddSession(Transition):
         return [current_max_id], [self.local_variable_idx]
     
     def __str__(self):
-        return f"POST {self.parameters['type']} session to {self.parameters['source']} with data {self.parameters['data']}"
+        if self.string_parameters is None:
+            return f"ADD Session with local_variable_idx {self.local_variable_idx}"
+        else:
+            source = self.string_parameters["source"]
+            type = self.string_parameters["type"]
+            url = "[BASE_URL]/api/sessions/{source}/{type}"
+            target_transition = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + f" = request.post({url}"
+            data = f"{self.producer.name}['data']"
+            return (
+                f"source = {self.producer.name}['source']\n"
+                f"type = {self.producer.name}['type']\n"
+                f"url = f'{url}'\n"
+                f"{target_transition}"
+                f", headers={{\"Content-Type\": \"application/json\"}}"
+                f", data=json.dumps({data})) # Local_variable_idx {self.local_variable_idx} being modified. source={source}, type={type}, data={self.string_parameters['data']}"
+            )
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
@@ -666,6 +709,11 @@ class AddSession(Transition):
         variable_schema.local_states["variables"][local_states[0]].value = new_session # Add session will return.
         variable_schema.local_states["variables"][local_states[0]].updated = False
         variable_schema.local_states["variables"][local_states[0]].latest_call = self.calling_timestamp
+        self.string_parameters = {
+            "source": self.parameters["source"],
+            "type": self.parameters["type"],
+            "data": self.parameters["data"],
+        }
         return variable_schema
 
 class GetSessionByQuery(Transition):
@@ -708,19 +756,36 @@ class GetSessionByQuery(Transition):
         return result, None
     
     def __str__(self):
-        return f"GET {self.parameters['type']} session from {self.parameters['source']} with field {self.parameters['field']} and value {self.parameters['value']}"
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        url = "[BASE_URL]/api/sessions/{source}/{type}/query"
+        target_transition = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + f" = request.get({url}"
+        return (
+            f"source = {self.producer.name}['source']\n"
+            f"type = {self.producer.name}['type']\n"
+            f"field = {self.producer.name}['field']\n"
+            f"value = {self.producer.name}['value']\n"
+            f"url = f'{url}'\n"
+            f"{target_transition}"
+            f", params={{\"field\": field, \"value\": value}})"
+            #f' params={{"field": "{self.parameters["field"]}", "value": "{self.parameters["value"]}"}})'
+            f'  # source={source}, type={type}, field={self.parameters["field"]}, value={self.parameters["value"]}'
+        )
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
-        for state_id in implicit_states:
+        for idx, state_id in enumerate(implicit_states):
             state = variable_schema.implicit_states["sessions"][state_id]
             state.transitions.append({
                 "name": self.name,
                 "parameters": self.parameters,
             })
-            local_variable = LocalVariable(value=copy.deepcopy(state), 
-                                           updated=False, 
-                                           latest_call=self.calling_timestamp, 
-                                           created_by=f"{self.name}@{self.calling_timestamp}")
+            local_variable = LocalVariable(
+                name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + f"[{idx}]",
+                value=copy.deepcopy(state), 
+                updated=False, 
+                latest_call=self.calling_timestamp, 
+                created_by=f"{self.name}@{self.calling_timestamp}"
+            )
             variable_schema.add_local_variable(local_variable)
         return variable_schema
 
@@ -762,7 +827,24 @@ class GetSession(Transition):
         return [["source", "type", "id"]]
     
     def __str__(self):
-        return f"GET {self.parameters['type']} session from {self.parameters['source']} with id {self.parameters['id']}"
+        if self.producer is None:
+            return (
+                RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + " = request.get("
+                f'"[BASE_URL]/api/sessions/{self.parameters["source"]}/{str(self.parameters["type"])}/{self.parameters["id"]})"'
+            )
+        else:
+            source = self.parameters["source"]
+            type = self.parameters["type"]
+            id = self.parameters["id"]
+            url = '[BASE_URL]/api/sessions/{source}/{type}/{id}'
+            return (
+                f"source = {self.producer.name}['source']\n"
+                f"type = {self.producer.name}['type']\n"
+                f"id = {self.producer.name}['id']\n"
+                f"url = f'{url}'\n"
+                f"{RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)} = request.get({url})"
+                f'  # source={source}, type={type}, id={id}'
+            )
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         for state_id in implicit_states:
@@ -771,10 +853,13 @@ class GetSession(Transition):
                 "name": self.name,
                 "parameters": self.parameters,
             })
-            local_variable = LocalVariable(value=copy.deepcopy(state), 
-                                           updated=False, 
-                                           latest_call=self.calling_timestamp, 
-                                           created_by=f"{self.name}@{self.calling_timestamp}")
+            local_variable = LocalVariable(
+                name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp),
+                value=copy.deepcopy(state), 
+                updated=False, 
+                latest_call=self.calling_timestamp, 
+                created_by=f"{self.name}@{self.calling_timestamp}"
+                )
             variable_schema.add_local_variable(local_variable)
         return variable_schema
 
@@ -808,7 +893,26 @@ class UpdateSession(Transition):
         return [self.parameters["id"]], None
     
     def __str__(self):
-        return f"PUT {self.parameters['type']} session from {self.parameters['source']} with id {self.parameters['id']} and data {self.parameters['data']}"
+        if self.producer is None:
+            return (
+                RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + " = request.put("
+                f'"[BASE_URL]/api/sessions/{self.parameters["source"]}/{str(self.parameters["type"])}/{self.parameters["id"]}',
+                f'headers={{"Content-Type\": \"application/json\"}},'
+                f'data=json.dumps({self.parameters["data"]}))'
+        )
+        else:
+            source = self.parameters["source"]
+            type = self.parameters["type"]
+            id = self.parameters["id"]
+            url = '[BASE_URL]/api/sessions/{source}/{type}/{id}'
+            return (
+                f"source = {self.producer.name}['source']\n"
+                f"type = {self.producer.name}['type']\n"
+                f"id = {self.producer.name}['id']\n"
+                f"url = f'{url}'\n"
+                f"{RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)} = request.put({url}, headers={{\"Content-Type\": \"application/json\"}}, data=json.dumps({self.producer.name}['data']))"
+                f'  # source={source}, type={type}, id={id}, data={self.parameters["data"]}'
+            )
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
@@ -867,8 +971,24 @@ class DeleteSession(Transition):
         return [self.parameters["id"]], None
     
     def __str__(self):
-        return f"DELETE {self.parameters['type']} session from {self.parameters['source']} with id {self.parameters['id']}"
-    
+        if self.producer is None:
+            return (
+                RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + " = request.delete("
+                f'"[BASE_URL]/api/sessions/{self.parameters["source"]}/{str(self.parameters["type"])}/{self.parameters["id"]})'
+            )
+        else:
+            source = self.producer.current_value["source"]
+            type = self.producer.current_value["type"]
+            id = self.producer.current_value["id"]
+            url = '[BASE_URL]/api/sessions/{source}/{type}/{id}'
+            return (
+                f"source = {self.producer.name}['source']\n"
+                f"type = {self.producer.name}['type']\n"
+                f"id = {self.producer.name}['id']\n"
+                f"url = f'{url}'\n"
+                f"{RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)} = request.delete({url})"
+                f'  # source={source}, type={type}, id={id}'
+            )
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
         if implicit_states[0] not in variable_schema.implicit_states["sessions"]:
@@ -903,6 +1023,7 @@ class LocalEdit(Transition):
         assert "value" in parameters
         super().__init__(name="LocalEdit", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
+        self.string_parameters = None
         
     @staticmethod
     def get_required_parameters() -> List[List[str]]:
@@ -933,10 +1054,31 @@ class LocalEdit(Transition):
             local_variable.value.current_value["data"][self.parameters["field"]] = self.parameters["value"]
         local_variable.updated = True
         local_variable.latest_call = self.calling_timestamp
+        self.string_parameters = {
+            "left_variable": local_variable.name,
+            "right_variable": variable_schema.local_states["variables"][self.parameters["local_variable_2_idx"]].name,
+            "meta_field": self.parameters["meta_field"],
+            "field": self.parameters["field"],
+            "value": self.parameters["value"]
+        }
         return variable_schema
 
     def __str__(self):
-        return f"LOCAL EDIT {self.parameters['session'].current_value['id']} with field {self.parameters['field']} to {self.parameters['value']}"
+        if self.string_parameters is None:
+            return (
+                f"LOCAL EDIT {self.parameters['session'].current_value['id']} with field {self.parameters['field']} to {self.parameters['value']}"
+            )
+        else:
+            all_fields = []
+            all_fields.append(self.string_parameters["meta_field"])
+            if self.string_parameters["field"] is not None:
+                all_fields.append(self.string_parameters["field"])
+            left_string = get_nested_path_string(self.string_parameters["left_variable"], all_fields)
+            right_string = get_nested_path_string(self.string_parameters["right_variable"], all_fields)
+            return (
+                f"{left_string} = {right_string}"
+                f'  # FROM {self.producer.name}'
+            )
 
 
 
@@ -947,18 +1089,21 @@ if __name__ == "__main__":
     
     # ==== Initialize the variable schema ====
     all_state = SessionVariableSchema()
-    init_variable_1 = LocalVariable(value=Session(id="local_1", 
-                                                  source="test", 
-                                                  type="main_session", 
-                                                  data={"title": "user_provided_data_1"},
-                                                  created_by="init_variable_1"
-                                                  ), 
-                                updated=False, 
-                                latest_call=0,
-                                created_by="local_init_variable_1"
-                                )
+    init_variable_1 = LocalVariable(
+        name="local_1",
+        value=Session(id="local_1", 
+                        source="test", 
+                        type="main_session", 
+                        data={"title": "user_provided_data_1"},
+                        created_by="init_variable_1"
+                        ), 
+                    updated=False, 
+                    latest_call=0,
+                    created_by="local_init_variable_1"
+                    )
 
     init_variable_2 = LocalVariable(
+        name="local_2",
         value = Session(id="local_2", 
                         source="test", 
                         type="virtual_study", 
