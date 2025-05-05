@@ -163,6 +163,16 @@ class Session(State):
     def get_id(self):
         return self.id
 
+    def __str__(self):
+        return_str = "{"
+        for key, value in self.current_value.items():
+            if isinstance(value, float) or isinstance(value, int):
+                return_str += f"{key}: {value:.2f}, "
+            else:
+                return_str += f"{key}: '{value}', "
+        return_str = return_str[:-2] + "}"
+        return return_str
+    
 @dataclass
 class LocalVariable:
     value: Any
@@ -195,6 +205,7 @@ class SessionVariableSchema(Schema):
         ]
         self.local_call_map = {}
         self.implicit_call_map = {}
+        self.init_local_str = []
     
     def add_local_variable(self, local_variable: LocalVariable):
         self.local_states["variables"].append(local_variable)
@@ -285,8 +296,10 @@ class SessionVariableSchema(Schema):
                                     type=chosen_implicit_variable.current_value["type"],
                                     data=None)
                 self.add_local_variable_using_state(new_session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG)
-    
 
+        for idx, local_variable in enumerate(self.local_states["variables"]):
+            self.init_local_str.append([idx, local_variable.name, str(local_variable.value)])
+            
     def obtain_if_condition(self):
         """
         Obtain the condition for the if-else transition.
@@ -342,6 +355,61 @@ class SessionVariableSchema(Schema):
             else:
                 return True
         return True
+    
+    def postprocess_transitions(self, remaining_call: int) -> Tuple[bool, List[str]]:
+        """
+        Postprocess the transitions.
+        """
+        updated_list = []
+        transitions = []
+        for idx, local_variable in enumerate(self.local_states["variables"]):
+            if local_variable.updated:
+                updated_list.append(idx)
+        
+        updated_list = sorted(updated_list, reverse=True) # The latest updated variable should be submitted first.
+        if len(updated_list) >= remaining_call:
+            available_num = min(remaining_call, len(updated_list))
+            for idx in updated_list:
+                variable_id = self.local_states["variables"][idx].value.current_value["id"]
+                if variable_id is None:
+                    # AddSession should be done
+                    target_parameters = {
+                        "local_variable": self.local_states["variables"][idx],
+                        "local_variable_idx": idx,
+                    }
+                    latest_call = self.local_states["variables"][idx].latest_call
+                    whether_updated = self.local_states["variables"][idx].updated
+                    producer_variable_idx = idx
+                    transition_name = "AddSession"
+                    transition_pairs = [self.form_pair_transition(self.local_states["variables"][idx].value, transition_name)]
+                else:
+                    # UpdateSession should be done
+                    target_parameters = {
+                        "source": self.local_states["variables"][idx].value.current_value["source"],
+                        "type": self.local_states["variables"][idx].value.current_value["type"],
+                        "id": self.local_states["variables"][idx].value.current_value["id"],
+                        "data": self.local_states["variables"][idx].value.current_value["data"],
+                    }
+                    latest_call = self.local_states["variables"][idx].latest_call
+                    whether_updated = self.local_states["variables"][idx].updated
+                    producer_variable_idx = idx
+                    transition_name = "UpdateSession"
+                    transition_pairs = [self.form_pair_transition(self.local_states["variables"][idx].value, transition_name)]
+                    
+                transitions.append({
+                        "required_parameters": target_parameters,
+                        "latest_call": latest_call,
+                        "whether_updated": whether_updated,
+                        "producer_variable_idx": producer_variable_idx,
+                        "transition_pairs": transition_pairs,
+                        "transition_name": transition_name,
+                })
+                available_num -= 1
+                if available_num == 0:
+                    break
+            return True, transitions
+        else:
+            return False, []
     
     def get_available_transitions(self, 
                                   random_generator: SessionRandomInitializer, 
@@ -977,9 +1045,9 @@ class DeleteSession(Transition):
                 f'"[BASE_URL]/api/sessions/{self.parameters["source"]}/{str(self.parameters["type"])}/{self.parameters["id"]})'
             )
         else:
-            source = self.producer.current_value["source"]
-            type = self.producer.current_value["type"]
-            id = self.producer.current_value["id"]
+            source = self.parameters["source"]
+            type = self.parameters["type"]
+            id = self.parameters["id"]
             url = '[BASE_URL]/api/sessions/{source}/{type}/{id}'
             return (
                 f"source = {self.producer.name}['source']\n"
@@ -1054,6 +1122,7 @@ class LocalEdit(Transition):
             local_variable.value.current_value["data"][self.parameters["field"]] = self.parameters["value"]
         local_variable.updated = True
         local_variable.latest_call = self.calling_timestamp
+        variable_schema.local_states["variables"][self.parameters["local_variable_2_idx"]].updated = False
         self.string_parameters = {
             "left_variable": local_variable.name,
             "right_variable": variable_schema.local_states["variables"][self.parameters["local_variable_2_idx"]].name,
@@ -1077,7 +1146,7 @@ class LocalEdit(Transition):
             right_string = get_nested_path_string(self.string_parameters["right_variable"], all_fields)
             return (
                 f"{left_string} = {right_string}"
-                f'  # FROM {self.producer.name}'
+                f'  # Local Variable Edit from {self.producer.name}'
             )
 
 
