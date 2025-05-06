@@ -253,7 +253,7 @@ class TraceGenerator:
                         producer = copy.deepcopy(self.state_schema.local_states["variables"][producer])
                     else:
                         producer = None
-                    new_transition = self.state_schema.craft_transition(transition["required_parameters"], i + idx + 1, transition_name, producer)
+                    new_transition = self.state_schema.craft_transition(transition, i + idx + 1, transition_name, producer)
                     implicit, local = new_transition.get_effected_states(self.state_schema)
                     new_transition.apply(implicit, local, self.state_schema)
                     trace.append([transition_name, copy.deepcopy(transition["required_parameters"])])
@@ -323,7 +323,7 @@ class TraceGenerator:
                 else:
                     producer = None
                 #producer_info = f"FROM local_variable_idx: {producer}, created_by: {self.state_schema.local_states['variables'][producer].created_by}"
-                new_transition = self.state_schema.craft_transition(target_transition_info["required_parameters"], i+1, selected[0], producer)
+                new_transition = self.state_schema.craft_transition(target_transition_info, i+1, selected[0], producer)
                 if selected[0] not in this_trace_duplicate_local_variable_map:
                     this_trace_duplicate_local_variable_map[selected[0]] = set([])
                 this_trace_duplicate_local_variable_map[selected[0]].add(self.state_schema.transform_parameters_to_str(target_transition_info["required_parameters"]))
