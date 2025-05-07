@@ -13,6 +13,7 @@ import json
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
+from Sgenerator.state import INDENT
 
 class SessionType(str, Enum):
     MAIN_SESSION = "main_session"
@@ -216,7 +217,6 @@ class SessionVariableSchema(Schema):
         ]
         self.local_call_map = {}
         self.implicit_call_map = {}
-        self.init_local_str = []
         self.init_implict_dict = {}
         
         
@@ -227,7 +227,11 @@ class SessionVariableSchema(Schema):
         self.local_states["variables"] = []
         self.implicit_states["sessions"] = {}
         self.implicit_states["latest_call"] = {}
-    
+        self.init_local_str = []
+        self.local_call_map = {}
+        self.implicit_call_map = {}
+        self.init_implict_dict = {}
+        
     def add_local_variable_using_state(self, state: Session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG):
         local_variable = LocalVariable(
             name=created_by+f"_{len(self.local_states['variables'])}",
@@ -335,27 +339,55 @@ class SessionVariableSchema(Schema):
         # ====== Local Variable Alignment ======
         
         for idx, local_variable in enumerate(self.local_states["variables"]):
-            self.init_local_str.append([idx, local_variable.name, str(local_variable.value)])
+            self.add_local_constant(str(local_variable.value), local_variable.name)
+            #self.init_local_str.append([idx, local_variable.name, str(local_variable.value)])
         
         for idx, session in self.implicit_states["sessions"].items():
             self.init_implict_dict[idx] = session.current_value
-            
+    
+    def add_local_constant(self, value, name=None):
+        if name is None:
+            name = f"local_constant_{len(self.init_local_str)}"
+        if isinstance(value, float) or isinstance(value, int):
+            pass
+        else:
+            value = f"\"{str(value)}\""
+        self.init_local_str.append([len(self.init_local_str), name, value])
+        return name
+        
     def obtain_if_condition(self):
         """
         Obtain the condition for the if-else transition.
         """
         for idx in range(len(self.local_states["variables"])-1, -1, -1):
             local_variable = self.local_states["variables"][idx]
-            if local_variable.created_by == USER_FUNCTION_PARAM_FLAG:
+            skip_flag = False
+            for transition in local_variable.value.transitions:
+                if transition['name'] == "AddSession" or transition['name'] == "UpdateSession" \
+                    or transition['name'] == "LocalEdit" or transition['name'] == "DeleteSession":
+                    # AddSession means we know everything about the local variable.
+                    # So we do not need to consider the if-else transition.
+                    skip_flag = True
+                    break
+            if skip_flag:
+                continue
+            if local_variable.created_by == USER_FUNCTION_PARAM_FLAG and len(self.local_call_map) == 0:
+                # For user-provided local variable and the first line of the program,
+                # source and type could be used as the condition.
                 meta_field = random.choice([key for key in local_variable.value.current_value.keys() \
                     if key in ["source", "type", "data"] and local_variable.value.current_value[key] is not None])
             else:
+                # For NON-user-provided local variable, the program must have its source and type.
+                # So we only need to consider the data field.
                 meta_field = "data"
             if meta_field == "source" or meta_field == "type":
                 if_condition = (idx, (meta_field, ), local_variable.value.current_value[meta_field])
             elif meta_field == "data":
-                field = random.choice(list(local_variable.value.current_value["data"].keys()))  
-                if_condition = (local_variable.name, ("data", field), local_variable.value.current_value["data"][field])
+                if local_variable.value.current_value["data"] is None:
+                    if_condition = (local_variable.name, ("data", ), "None")
+                else:
+                    field = random.choice(list(local_variable.value.current_value["data"].keys()))  
+                    if_condition = (local_variable.name, ("data", field), local_variable.value.current_value["data"][field])
             return if_condition
             
                 
@@ -735,7 +767,8 @@ class SessionVariableSchema(Schema):
                     created_by=USER_FUNCTION_PARAM_FLAG
                 )
                 self.add_local_variable(new_local_variable)
-                self.init_local_str.append([len(self.local_states["variables"]) - 1, new_local_variable.name, str(new_local_variable.value)])
+                #self.init_local_str.append([len(self.local_states["variables"]) - 1, new_local_variable.name, str(new_local_variable.value)])
+                self.add_local_constant(str(new_local_variable.value), new_local_variable.name)
                 parameters["local_variable_2_idx"] = len(self.local_states["variables"]) - 1
                 producer = copy.deepcopy(self.local_states["variables"][parameters["local_variable_2_idx"]])
                 
@@ -809,6 +842,26 @@ class GetSessions(Transition):
             f"{variable_name}.raise_for_status()\n"
             f"{variable_name} = {variable_name}.json()"
         )
+    
+    def get_program_str(self) -> Tuple[List[str], str]:
+        """
+        Return the program string in line and the indent.
+        """
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        url = "{BASE_URL}/api/sessions/{source}/{type}"
+        variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        target_transition = variable_name + f" = requests.get(url)"
+        result = [
+            f"source = {self.producer.name}['source']\n",
+            f"type = {self.producer.name}['type']\n",
+            f"url = f'{url}'\n",
+            f"{target_transition}"
+            f"    # FROM {self.producer.name}. source={source}, type={type}\n",
+            f"{variable_name}.raise_for_status()\n",
+            f"{variable_name} = {variable_name}.json()"
+        ]
+        return result, ""
     
     @staticmethod
     def get_required_parameters() -> List[str]:
@@ -908,6 +961,25 @@ class AddSession(Transition):
                 f"{variable_name} = {variable_name}.json()"
             )
     
+    def get_program_str(self) -> Tuple[List[str], str]:
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        url = "{BASE_URL}/api/sessions/{source}/{type}"
+        variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        target_transition = variable_name + f" = requests.post(url"
+        data = f"{self.producer.name}['data']"
+        result = [
+            f"source = {self.producer.name}['source']\n",
+            f"type = {self.producer.name}['type']\n",
+            f"url = f'{url}'\n",
+            f"{target_transition}"
+            f", headers={{\"Content-Type\": \"application/json\"}}"
+            f", data=json.dumps({data})) # Local_variable_idx {self.local_variable_idx} being modified. source={source}, type={type}, data={self.string_parameters['data']}\n",
+            f"{variable_name}.raise_for_status()\n",
+            f"{variable_name} = {variable_name}.json()"
+        ]
+        return result, ""
+    
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
         new_session = Session(id=str(implicit_states[0]), 
@@ -1000,6 +1072,26 @@ class GetSessionByQuery(Transition):
             f"{variable_name} = {variable_name}.json()"
         )
     
+    def get_program_str(self) -> Tuple[List[str], str]:
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        url = "{BASE_URL}/api/sessions/{source}/{type}/query"
+        variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        target_transition = variable_name + f" = requests.get(url"
+        result = [
+            f"source = {self.producer.name}['source']\n",
+            f"type = {self.producer.name}['type']\n",
+            f"field = {self.producer.name}['field']\n",
+            f"value = {self.producer.name}['value']\n",
+            f"url = f'{url}'\n",
+            f"{target_transition}"
+            f", params={{\"field\": field, \"value\": value}})"
+            f'  # source={source}, type={type}, field={self.parameters["field"]}, value={self.parameters["value"]}\n',
+            f"{variable_name}.raise_for_status()\n",
+            f"{variable_name} = {variable_name}.json()",
+        ]
+        return result, ""
+    
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         for idx, state_id in enumerate(implicit_states):
             state = variable_schema.implicit_states["sessions"][state_id]
@@ -1078,6 +1170,25 @@ class GetSession(Transition):
                 f"{variable_name}.raise_for_status()\n"
                 f"{variable_name} = {variable_name}.json()"
             )
+            
+    def get_program_str(self) -> Tuple[List[str], str]:
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        id = self.parameters["id"]
+        url = '{BASE_URL}/api/sessions/{source}/{type}/{id}'
+        variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        target_transition = variable_name + f" = requests.get(url)"
+        result = [
+            f"source = {self.producer.name}['source']\n",
+            f"type = {self.producer.name}['type']\n",
+            f"id = {self.producer.name}['id']\n",
+            f"url = f'{url}'\n",
+            f"{target_transition}"
+            f'  # source={source}, type={type}, id={id}\n',
+            f"{variable_name}.raise_for_status()\n",
+            f"{variable_name} = {variable_name}.json()"
+        ]
+        return result, ""
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         for state_id in implicit_states:
@@ -1151,6 +1262,25 @@ class UpdateSession(Transition):
                 f"{variable_name} = {variable_name}.json()"
             )
     
+    def get_program_str(self) -> Tuple[List[str], str]:
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        id = self.parameters["id"]
+        url = '{BASE_URL}/api/sessions/{source}/{type}/{id}'
+        variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        target_transition = variable_name + f" = requests.put(url, headers={{\"Content-Type\": \"application/json\"}}, data=json.dumps({self.producer.name}['data']))"
+        result = [
+            f"source = {self.producer.name}['source']\n",
+            f"type = {self.producer.name}['type']\n",
+            f"id = {self.producer.name}['id']\n",
+            f"url = f'{url}'\n",
+            f"{target_transition}"
+            f'  # source={source}, type={type}, id={id}, data={self.parameters["data"]}\n',
+            f"{variable_name}.raise_for_status()\n",
+            f"{variable_name} = {variable_name}.json()",
+        ]
+        return result, ""
+    
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
         if implicit_states[0] not in variable_schema.implicit_states["sessions"]:
@@ -1201,6 +1331,7 @@ class DeleteSession(Transition):
         self.calling_timestamp = calling_timestamp
         self.string_parameters = {
             "for_loop": "",
+            "if_condition": "",
             "indent": ""
         }
 
@@ -1232,15 +1363,15 @@ class DeleteSession(Transition):
     def add_string_parameters(self, if_condition, variable_name):
         if if_condition is not None:
             self.string_parameters = {
-                "for_loop": 
-                    f"for {LOOP_ITEM_NAME} in {variable_name}:\n"
-                    f"    if {LOOP_ITEM_NAME}['{if_condition[0]}'] == {if_condition[1]}:\n",
-                "indent": "        "
+                "for_loop": f"for {LOOP_ITEM_NAME} in {variable_name}:\n",
+                "indent": INDENT * 2,
+                "if_condition": f"    if {LOOP_ITEM_NAME}['{if_condition[0]}'] == {if_condition[1]}:\n"
             }
         else:
             self.string_parameters = {
                 "for_loop": f"for {LOOP_ITEM_NAME} in {variable_name}:\n",
-                "indent": "    "
+                "indent": INDENT,
+                "if_condition": ""
             }
         
     def get_effected_states(self, variable_schema: SessionVariableSchema) -> List[str]:
@@ -1265,6 +1396,7 @@ class DeleteSession(Transition):
             target_transition = variable_name + f" = requests.delete(url)"  
             return (
                 f"{self.string_parameters['for_loop']}"
+                f"{self.string_parameters['if_condition']}"
                 f"{self.string_parameters['indent']}"
                 f"source = {item_name}['source']\n"
                 f"{self.string_parameters['indent']}"
@@ -1275,14 +1407,46 @@ class DeleteSession(Transition):
                 f"url = f'{url}'\n"
                 f"{self.string_parameters['indent']}"
                 f"{target_transition}"
-                f"{self.string_parameters['indent']}"
                 f'  # source={source}, type={type}, id={id}\n'
                 f"{self.string_parameters['indent']}"
                 f"{variable_name}.raise_for_status()\n"
                 f"{self.string_parameters['indent']}"
                 f"{variable_name} = {variable_name}.json()"
             )
-            
+    
+    def get_program_str(self) -> Tuple[List[str], str]:
+        source = self.parameters["source"]
+        type = self.parameters["type"]
+        id = self.parameters["id"]
+        url = '{BASE_URL}/api/sessions/{source}/{type}/{id}'
+        if self.string_parameters["for_loop"] != "":
+            item_name = LOOP_ITEM_NAME
+        else:
+            item_name = self.producer.name
+        variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        target_transition = variable_name + f" = requests.delete(url)"  
+        result = [
+            f"{self.string_parameters['for_loop']}",
+            f"{self.string_parameters['if_condition']}",
+            f"{self.string_parameters['indent']}"
+            f"source = {item_name}['source']\n",
+            f"{self.string_parameters['indent']}"
+            f"type = {item_name}['type']\n",
+            f"{self.string_parameters['indent']}"
+            f"id = {item_name}['id']\n",
+            f"{self.string_parameters['indent']}"
+            f"url = f'{url}'\n",
+            f"{self.string_parameters['indent']}"
+            f"{target_transition}"
+            f'  # source={source}, type={type}, id={id}\n',
+            f"{self.string_parameters['indent']}"
+            f"{variable_name}.raise_for_status()\n",
+            f"{self.string_parameters['indent']}"
+            f"{variable_name} = {variable_name}.json()"
+        ]
+        result = [item for item in result if item != ""]
+        return result, ""
+        
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
         if implicit_states[0] not in variable_schema.implicit_states["sessions"]:
@@ -1374,7 +1538,19 @@ class LocalEdit(Transition):
                 f"{left_string} = {right_string}"
                 f'  # Local Variable Edit from {self.producer.name}'
             )
-
+    
+    def get_program_str(self) -> Tuple[List[str], str]:
+        all_fields = []
+        all_fields.append(self.string_parameters["meta_field"])
+        if self.string_parameters["field"] is not None:
+            all_fields.append(self.string_parameters["field"])
+        left_string = get_nested_path_string(self.string_parameters["left_variable"], all_fields)
+        right_string = get_nested_path_string(self.string_parameters["right_variable"], all_fields)
+        result = [
+            f"{left_string} = {right_string}"
+            f'  # Local Variable Edit from {self.producer.name}',
+        ]
+        return result, ""
 
 class SessionEvaluator:
     def __init__(self, init_implicit_dict: Dict[str, Any], config: Dict[str, Any]):
