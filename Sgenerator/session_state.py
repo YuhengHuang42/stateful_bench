@@ -219,7 +219,13 @@ class SessionVariableSchema(Schema):
         self.implicit_call_map = {}
         self.init_implict_dict = {}
         
-        
+    def normalize_data(self, data):
+        data = dict(data)
+        for key in data:
+            if isinstance(data[key], SessionType):
+                data[key] = data[key].value
+        return data
+    
     def add_local_variable(self, local_variable: LocalVariable):
         self.local_states["variables"].append(local_variable)
     
@@ -339,21 +345,11 @@ class SessionVariableSchema(Schema):
         # ====== Local Variable Alignment ======
         
         for idx, local_variable in enumerate(self.local_states["variables"]):
-            self.add_local_constant(str(local_variable.value), local_variable.name)
+            self.add_local_constant(self.normalize_data(local_variable.value.current_value), local_variable.name)
             #self.init_local_str.append([idx, local_variable.name, str(local_variable.value)])
         
         for idx, session in self.implicit_states["sessions"].items():
             self.init_implict_dict[idx] = session.current_value
-    
-    def add_local_constant(self, value, name=None):
-        if name is None:
-            name = f"local_constant_{len(self.init_local_str)}"
-        if isinstance(value, float) or isinstance(value, int):
-            pass
-        else:
-            value = f"\"{str(value)}\""
-        self.init_local_str.append([len(self.init_local_str), name, value])
-        return name
         
     def obtain_if_condition(self):
         """
@@ -582,9 +578,11 @@ class SessionVariableSchema(Schema):
                         local_data = local_variable.value.current_value["data"]
                         if local_data is None or len(local_data.keys()) == 0:
                             field = "title"
+                            exclude = None
                         else:
                             field = random.choice(list(local_variable.value.current_value["data"].keys()))
-                        value = random_generator.random_generate_session_data(meta_field, field, exclude=local_variable.value.current_value["data"][field])
+                            exclude = local_data[field]
+                        value = random_generator.random_generate_session_data(meta_field, field, exclude=exclude)
                     else:
                         field = None
                         value = random_generator.random_generate_session_data(meta_field, exclude=local_variable.value.current_value[meta_field])
@@ -691,6 +689,7 @@ class SessionVariableSchema(Schema):
                                             continue
                                         else:
                                             has_implicit_variable = True
+                                            getsession_implicit_variable = self.implicit_states["sessions"][key]
                                             break
                                     else:
                                         has_implicit_variable = True
@@ -701,12 +700,20 @@ class SessionVariableSchema(Schema):
                         if satisfied:
                             target_parameters = {}
                             if transition.__name__ == "GetSessionByQuery":
-                                field = random.choice(list(local_variable.value.current_value["data"].keys()))
+                                field = random.choice(list(getsession_implicit_variable.current_value["data"].keys()))
+                                local_data = local_variable.value.current_value["data"]
+                                if local_data is not None and field in local_data and local_data[field] == getsession_implicit_variable.current_value["data"][field]:
+                                    value = local_data[field]
+                                    value_from_variable = True
+                                else:
+                                    value = getsession_implicit_variable.current_value["data"][field]
+                                    value_from_variable = False
                                 target_parameters = {
                                     "source": local_variable.value.current_value["source"],
                                     "type": local_variable.value.current_value["type"],
                                     "field": field,
-                                    "value": local_variable.value.current_value["data"][field],
+                                    "value": value,
+                                    "value_from_variable": value_from_variable
                                 }
                             else:
                                 for parameter in required_parameters:
@@ -768,10 +775,9 @@ class SessionVariableSchema(Schema):
                 )
                 self.add_local_variable(new_local_variable)
                 #self.init_local_str.append([len(self.local_states["variables"]) - 1, new_local_variable.name, str(new_local_variable.value)])
-                self.add_local_constant(str(new_local_variable.value), new_local_variable.name)
+                self.add_local_constant(self.normalize_data(new_local_variable.value.current_value), new_local_variable.name)
                 parameters["local_variable_2_idx"] = len(self.local_states["variables"]) - 1
                 producer = copy.deepcopy(self.local_states["variables"][parameters["local_variable_2_idx"]])
-                
         transition_class = globals()[transition]
         new_transition = transition_class(
             parameters=parameters, 
@@ -796,16 +802,26 @@ class SessionVariableSchema(Schema):
                 if len(local_list) == 0:
                     if_condition = None
                 else:
-                    name_idx = len(self.local_states["variables"]) + 1
-                    init_variable_name = f"User_parameter_{name_idx}"
                     if_condition = DeleteSession.get_if_condition(local_list, self.local_states["variables"][idx])
-                    if isinstance(if_condition[1], float) or isinstance(if_condition[1], int):
-                        right_str = f"{if_condition[1]}"
-                    else:
-                        right_str = f"\"{if_condition[1]}\""
-                    self.init_local_str.append([str(idx) + "_single", init_variable_name, right_str])
+                    #if isinstance(if_condition[1], float) or isinstance(if_condition[1], int):
+                    #    right_str = f"{if_condition[1]}"
+                    #else:
+                    #    right_str = f"\"{if_condition[1]}\""
+                    init_variable_name = self.add_local_constant(if_condition[1])
+                    #self.init_local_str.append([str(idx) + "_single", init_variable_name, right_str])
                     if_condition[1] = init_variable_name
                 new_transition.add_string_parameters(if_condition, variable_name)
+        elif transition == "GetSessionByQuery":
+            field = transition_info["required_parameters"]["field"]
+            filed_name = self.add_local_constant(field)
+            if transition_info["required_parameters"]["value_from_variable"]:
+                local_variable_idx = transition_info["local_variable_idx"]
+                local_variable = self.local_states["variables"][local_variable_idx]
+                value_name = local_variable.name + "['data'][field]"
+            else:
+                value = transition_info["required_parameters"]["value"]
+                value_name = self.add_local_constant(value)
+            new_transition.string_parameters = {"field": filed_name, "value": value_name}
         return new_transition
     
 
@@ -997,9 +1013,10 @@ class AddSession(Transition):
         #variable_schema.local_states["variables"][local_states[0]].value = new_session # Add session will return.
         variable_schema.local_states["variables"][local_states[0]].updated = False
         #variable_schema.local_states["variables"][local_states[0]].latest_call = self.calling_timestamp
+        value = Session(id=str(implicit_states[0]), source=None, type=None, data=None)
         local_variable = LocalVariable(
             name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp),
-            value=copy.deepcopy(new_session), 
+            value=value,  # The API only returns the id of the session.
             updated=False, 
             latest_call=self.calling_timestamp, 
             created_by=f"{self.name}@{self.calling_timestamp}"
@@ -1034,6 +1051,7 @@ class GetSessionByQuery(Transition):
             parameters["type"] = SessionType(parameters["type"])
         super().__init__(name="GetSessionByQuery", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
+        self.string_parameters = None
 
     @staticmethod
     def get_required_parameters() -> List[str]:
@@ -1077,12 +1095,14 @@ class GetSessionByQuery(Transition):
         type = self.parameters["type"]
         url = "{BASE_URL}/api/sessions/{source}/{type}/query"
         variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
+        field = self.string_parameters["field"] # This field should be a constant variable name.
+        value = self.string_parameters["value"] # This value should be a constant variable name.
         target_transition = variable_name + f" = requests.get(url"
         result = [
             f"source = {self.producer.name}['source']\n",
             f"type = {self.producer.name}['type']\n",
-            f"field = {self.producer.name}['field']\n",
-            f"value = {self.producer.name}['value']\n",
+            f"field = {field}\n",
+            f"value = {value}\n",
             f"url = f'{url}'\n",
             f"{target_transition}"
             f", params={{\"field\": field, \"value\": value}})"

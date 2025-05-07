@@ -188,13 +188,13 @@ class Schema:
         """
         pass
 
-    @abstractmethod
-    def add_local_constant(self, value, name=None) -> str:
-        """
-        Add a local constant to the global schema.
-        Return the name of the local constant.
-        """
-        pass
+    def add_local_constant(self, value, name=None):
+        if name is None:
+            name = f"user_constant_{len(self.init_local_str)}"
+        if isinstance(value, str):    
+            value = f"\"{value}\""
+        self.init_local_str.append([len(self.init_local_str), name, value])
+        return name
     
 class RandomInitializer:
     """
@@ -349,10 +349,7 @@ class TraceGenerator:
                 implicit, local = new_transition.get_effected_states(self.state_schema)
                 new_transition.apply(implicit, local, self.state_schema)
                 trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
-                try:
-                    trace_str.append(new_transition.get_program_str())
-                except:
-                    trace_str.append(f"Error: {new_transition}")
+                trace_str.append(new_transition.get_program_str())
                 previous_transition_info = (selected[0], target_transition_info["required_parameters"])
         
         return (trace, trace_str), this_trace_duplicate_local_variable_map
@@ -439,11 +436,14 @@ def generate_program(trace_generator: TraceGenerator, trace_length: int, control
             
             else_string = f"else:\n"
             program = synthesize_trace_str(program, else_trace, else_string, INDENT)
-            all_init_str = set([])
+            all_init_str = []
             for init_str in if_trace_generator.state_schema.init_local_str:
-                all_init_str.add((init_str[1], init_str[2]))
+                # We do not use set because some elements might be non-hashable.
+                if (init_str[1], init_str[2]) not in all_init_str:
+                    all_init_str.append((init_str[1], init_str[2]))
             for init_str in else_trace_generator.state_schema.init_local_str:
-                all_init_str.add((init_str[1], init_str[2]))
+                if (init_str[1], init_str[2]) not in all_init_str:
+                    all_init_str.append((init_str[1], init_str[2]))
             init_program = ""
             for init_str in all_init_str:
                 init_program += f"{init_str[0]} = {init_str[1]}\n"
