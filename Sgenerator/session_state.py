@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections import OrderedDict
 import requests
 import json
+import traceback
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
@@ -79,8 +80,9 @@ class SessionRandomInitializer(RandomInitializer):
                      "members": [
                          fake.unique.email() for i in range(50)
                      ],
-                     "similarities": [i for i in range(100)],
-                     "significantDifferences": [i/100 for i in range(100)],
+                     "similarities": [str(i) for i in range(100)],
+                     # The score is a string. This is because Session Backend seems to not support float search for Query.
+                     "significantDifferences": [str(i/100) for i in range(100)],
                      }
         }
         self.already_generated = set([])
@@ -265,15 +267,26 @@ class SessionVariableSchema(Schema):
         self.implicit_states["sessions"][session.current_value["id"]] = session
         self.implicit_states["latest_call"][session.current_value["id"]] = latest_call
     
-    def get_implicit_states(self):
+    def get_implicit_states(self, current_value: bool = True):
         result = {}
-        for key, value in self.implicit_states["sessions"].items():
-            result[key] = dict()
-            for field in value.current_value.keys():
-                if isinstance(value.current_value[field], SessionType):
-                    result[key][field] = value.current_value[field].value
-                else:
-                    result[key][field] = value.current_value[field]
+        if current_value is True:
+            sessions = self.implicit_states["sessions"]
+            for key, value in sessions.items():
+                result[key] = dict()
+                for field in value.current_value.keys():
+                    if isinstance(value.current_value[field], SessionType):
+                        result[key][field] = value.current_value[field].value
+                    else:
+                        result[key][field] = value.current_value[field]
+        else:
+            sessions = self.init_implict_dict
+            for key, value in sessions.items():
+                result[key] = dict()
+                for field in value.keys():
+                    if isinstance(value[field], SessionType):
+                        result[key][field] = value[field].value
+                    else:
+                        result[key][field] = value[field]
         return result
     
     def get_latest_call_map(self):
@@ -366,7 +379,7 @@ class SessionVariableSchema(Schema):
             #self.init_local_str.append([idx, local_variable.name, str(local_variable.value)])
         
         for idx, session in self.implicit_states["sessions"].items():
-            self.init_implict_dict[idx] = session.current_value
+            self.init_implict_dict[idx] = copy.deepcopy(session.current_value)
         
     def obtain_if_condition(self):
         """
@@ -761,12 +774,14 @@ class SessionVariableSchema(Schema):
                         target_parameters = {}
                         if transition.__name__ == "GetSessionByQuery":
                             field = random.choice(list(getsession_implicit_variable.current_value["data"].keys()))
+                            value = getsession_implicit_variable.current_value["data"][field]
                             local_data = local_variable.value.current_value["data"]
-                            if local_data is not None and field in local_data and local_data[field] == getsession_implicit_variable.current_value["data"][field]:
-                                value = local_data[field]
-                                value_from_variable = True
+                            if local_data is not None and field in local_data:
+                                if local_data[field] == value:
+                                    value_from_variable = True
+                                else:
+                                    value_from_variable = False
                             else:
-                                value = getsession_implicit_variable.current_value["data"][field]
                                 value_from_variable = False
                             target_parameters = {
                                 "source": local_variable.value.current_value["source"],
@@ -816,7 +831,23 @@ class SessionVariableSchema(Schema):
                             exist_local_variable = set([i.value.current_value["id"] for i in exist_local_variable if i.value.current_value["id"] is not None])
                             if len(exist_local_variable) == 1:
                                 satisfied = False
-                                break
+                                continue
+                        if transition.__name__ == "DeleteSession":
+                            source = target_parameters["source"]
+                            type = target_parameters["type"]
+                            id = target_parameters["id"]
+                            has_corresponding = False
+                            for session in self.implicit_states["sessions"].values():
+                                if session.current_value["source"] == source and \
+                                    session.current_value["type"] == type and \
+                                    session.current_value["id"] == id and \
+                                    session.exist:
+                                    has_corresponding = True
+                                    break
+                            if not has_corresponding:
+                                satisfied = False
+                                continue
+                                
                         if transition.__name__ not in available_transitions:
                             available_transitions[transition.__name__] = []
                         transition_pairs = [self.form_pair_transition(local_variable.value, transition.__name__)]
@@ -956,7 +987,8 @@ class GetSessions(Transition):
             f"{target_transition}"
             f"  # FROM {self.producer.name}. source={source}, type={type}\n",
             f"{variable_name}.raise_for_status()\n",
-            f"{variable_name} = {variable_name}.json()"
+            f"{variable_name} = {variable_name}.json()\n",
+            f"{variable_name} = sorted({variable_name}, key=lambda x: x['id'])"
         ]
         return result, ""
     
@@ -1085,6 +1117,8 @@ class AddSession(Transition):
                               data=self.parameters["data"],
                               #created_by=f"{self.name}@{self.calling_timestamp}"
         )
+        local_transitions = copy.deepcopy(variable_schema.local_states["variables"][local_states[0]].value.transitions)
+        new_session.transitions = local_transitions
         new_session.transitions.append({
             "name": self.name,
             "parameters": self.parameters,
@@ -1095,6 +1129,10 @@ class AddSession(Transition):
         variable_schema.local_states["variables"][local_states[0]].updated = False
         #variable_schema.local_states["variables"][local_states[0]].latest_call = self.calling_timestamp
         value = Session(id=str(implicit_states[0]), source=None, type=None, data=None)
+        value.transitions.append({
+            "name": self.name,
+            "parameters": self.parameters,
+        })
         local_variable = LocalVariable(
             name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp),
             value=value,  # The API only returns the id of the session.
@@ -1335,7 +1373,14 @@ class UpdateSession(Transition):
         return [["source", "type", "id", "data"]]
     
     def get_effected_states(self, variable_schema: SessionVariableSchema) -> List[str]:
-        return [self.parameters["id"]], None
+        local_variable_idx = None
+        longest_transitions = -1
+        for idx, local_variable in enumerate(variable_schema.local_states["variables"]):
+            if local_variable.value.current_value["id"] == self.parameters["id"]:
+                if len(local_variable.value.transitions) > longest_transitions:
+                    longest_transitions = len(local_variable.value.transitions)
+                    local_variable_idx = idx
+        return [self.parameters["id"]], [local_variable_idx]
     
     def __str__(self):
         if self.producer is None:
@@ -1384,6 +1429,8 @@ class UpdateSession(Transition):
     
     def apply(self, implicit_states: List[str], local_states: List[str], variable_schema: SessionVariableSchema):
         assert len(implicit_states) == 1
+        assert len(local_states) == 1
+        local_transitions = copy.deepcopy(variable_schema.local_states["variables"][local_states[0]].value.transitions)
         if implicit_states[0] not in variable_schema.implicit_states["sessions"]:
             # Create a new session
             new_session = Session(id=implicit_states[0], 
@@ -1392,6 +1439,7 @@ class UpdateSession(Transition):
                                   data=self.parameters["data"],
                                   #created_by=f"{self.name}@{self.calling_timestamp}"
                                   )
+            new_session.transitions = local_transitions
             new_session.transitions.append({
                 "name": self.name,
                 "parameters": self.parameters,
@@ -1400,6 +1448,8 @@ class UpdateSession(Transition):
         else:
             # check whether the side effect is valid
             state = variable_schema.implicit_states["sessions"][implicit_states[0]]
+            if len(state.transitions) < len(local_transitions):
+                state.transitions = local_transitions
             state.transitions.append({
                 "name": self.name,
                 "parameters": self.parameters,
@@ -1466,7 +1516,7 @@ class DeleteSession(Transition):
             self.string_parameters = {
                 "for_loop": f"for {LOOP_ITEM_NAME} in {variable_name}:\n",
                 "indent": INDENT * 2,
-                "if_condition": f"{INDENT}if {LOOP_ITEM_NAME}['{if_condition[0]}'] == {if_condition[1]}:\n"
+                "if_condition": f"{INDENT}if '{if_condition[0]}' in {LOOP_ITEM_NAME} and {LOOP_ITEM_NAME}['{if_condition[0]}'] == {if_condition[1]}:\n"
             }
         else:
             self.string_parameters = {
@@ -1613,6 +1663,12 @@ class LocalEdit(Transition):
             local_variable.value.current_value["data"][self.parameters["field"]] = self.parameters["value"]
         local_variable.updated = True
         local_variable.latest_call = self.calling_timestamp
+        local_variable.value.transitions.append(
+            {
+                "name": self.name,
+                "parameters": self.parameters,
+            }
+        )
         variable_schema.local_states["variables"][self.parameters["local_variable_2_idx"]].updated = False
         self.string_parameters = {
             "left_variable": local_variable.name,
@@ -1655,7 +1711,7 @@ class LocalEdit(Transition):
             # It is nested data assignment
             # Perform if check for the dict.
             if_block = [
-                f"if '{all_fields[0]}' not in {self.string_parameters['left_variable']}:\n",
+                f"if '{all_fields[0]}' not in {self.string_parameters['left_variable']} or {self.string_parameters['left_variable']}['{all_fields[0]}'] is None:\n",
                 f"{INDENT}{self.string_parameters['left_variable']}['{all_fields[0]}'] = {{}}\n",
             ]
             result = if_block + result
@@ -1663,12 +1719,12 @@ class LocalEdit(Transition):
 
 class SessionEvaluator:
     def __init__(self, 
-                 init_implicit_dict: Dict[str, Any],
-                 init_local_list,
+                 #init_implicit_dict: Dict[str, Any],
+                 #init_local_list,
                  config: Dict[str, Any],
                  ):
-        self.init_implicit_dict = init_implicit_dict
-        self.init_local_list = init_local_list # Used to clean up local variables stored in the remote.
+        #self.init_implicit_dict = None
+        #self.init_local_list = None # Used to clean up local variables stored in the remote.
         self.config = config
         assert "base_url" in self.config
         self.test_cases = []
@@ -1678,12 +1734,30 @@ class SessionEvaluator:
         ]
         self.local_environment_str = "\n".join(self.local_environment)
     
-    def prepare_environment(self):
+    @classmethod
+    def load(cls, file_path: str, config: Dict[str, Any]):
+        with open(file_path, "r") as f:
+            saved_info = json.load(f)
+        if config is None:
+            config = saved_info["config"]
+        created_cls =  cls(config)
+        created_cls.test_cases = saved_info["test_cases"]
+        return created_cls
+
+    def store(self, file_path: str):
+        saved_info = {
+            "test_cases": self.test_cases,
+            "config": self.config
+        }
+        with open(file_path, "w") as f:
+            json.dump(saved_info, f)
+            
+    def prepare_environment(self, init_implicit_dict, init_local_list):
         source_type_pair = [set([]), set([])]
-        for idx in self.init_implicit_dict:
-            source_type_pair[0].add(self.init_implicit_dict[idx]["source"])
-            source_type_pair[1].add(self.init_implicit_dict[idx]["type"])
-        for item in self.init_local_list:
+        for idx in init_implicit_dict:
+            source_type_pair[0].add(init_implicit_dict[idx]["source"])
+            source_type_pair[1].add(init_implicit_dict[idx]["type"])
+        for item in init_local_list:
             item_data = item[1]
             if isinstance(item_data, str):
                 # User-defined constants
@@ -1713,8 +1787,8 @@ class SessionEvaluator:
                         )
                         delete_session.raise_for_status()
                     
-        for idx in self.init_implicit_dict:
-            session = self.init_implicit_dict[idx]
+        for idx in init_implicit_dict:
+            session = init_implicit_dict[idx]
             source = session["source"]
             type = session["type"]
             data = session["data"]
@@ -1731,15 +1805,20 @@ class SessionEvaluator:
         '''
         program_info:
             "init_local_str": init_local_str
-            "implict_list": [session_id: state]
+            "init_local_list": init_local_list
+            --> Both items are retuend by result["init_block"] of function generate_program
+            "init_implicit_dict": result["init_implicit_dict"]
+            --> All the three items above are related to the initial state of the program.
+            "end_implict_list": [session_id: state] --> Ending implicit states
         program:
             program_str
         '''
-        self.prepare_environment()
         complete_program = program_info["init_local_str"] + program
         namespace = {}
         complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
         complete_program = self.local_environment_str + "\n" + complete_program
+        
+        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_list'])
         exec(complete_program, namespace)
         
         # Collect States
@@ -1748,7 +1827,7 @@ class SessionEvaluator:
             result = namespace[RESULT_NAME]
         
         oracle = {}
-        implict_list = program_info["implict_list"]
+        implict_list = program_info["end_implict_list"]
         source_type_pair = set([])
         for state in implict_list:
             source_type_pair.add((state["source"], state["type"]))
@@ -1763,7 +1842,7 @@ class SessionEvaluator:
                     oracle[(source, type)] = []
                 oracle[(source, type)].append(session)
         
-        if "id" in result:
+        if result is not None and "id" in result:
             result.pop("id")
         test_case = {
             "result": result,
@@ -1774,21 +1853,33 @@ class SessionEvaluator:
         self.test_cases.append(test_case)
         return test_case
     
+    
     def evaluate(self, program: str, threshold: float=1e-4):
-        self.prepare_environment()
         pass_list = []
         test_case_pass_detail = []
         for idx, test_case in enumerate(self.test_cases):
             result_pass = True
+            self.prepare_environment(test_case["program_info"]["init_implicit_dict"], test_case["program_info"]["init_local_list"])
             complete_program = test_case["program_info"]["init_local_str"] + program
             namespace = {}
             complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
             complete_program = self.local_environment_str + "\n" + complete_program
-            exec(complete_program, namespace)
+            try:
+                exec(complete_program, namespace)
+            except Exception as e:
+                error_info = traceback.format_exc()
+                pass_list.append(False)
+                test_case_pass_detail.append({
+                    "result_pass": False,
+                    "error_info": error_info,
+                    "state_pass": None,
+                    "state_pass_detail": None
+                })
+                continue
             # ====== Evaluate variable oracle ======
             if f"{RESULT_NAME}" in namespace:
                 result = namespace[RESULT_NAME]
-                if "id" in result:
+                if result is not None and "id" in result:
                     result.pop("id")
                 if isinstance(result, float) or isinstance(result, int):
                     if abs(result - test_case["result"]) > threshold:
@@ -1803,6 +1894,9 @@ class SessionEvaluator:
                                 result_pass = False
                 elif result != test_case["result"]:
                     result_pass = False
+            else:
+                if test_case["result"] is not None:
+                    result_pass = False
             # ====== Evaluate state oracle ======
             state_pass = True
             state_pass_detail = {}
@@ -1812,16 +1906,21 @@ class SessionEvaluator:
                 response = requests.get(url)
                 response.raise_for_status()
                 response_json = response.json()
+                has_corresponding = True
                 for session in response_json:
                     source = session["source"]
                     type = session["type"]
                     data = session["data"]
+                    has_corresponding = False
                     for idx, oracle_session in enumerate(test_case["state_oracle"][(source, type)]):
                         if data == oracle_session["data"]:
                             local_oracle_list[idx] += 1
+                            has_corresponding = True
+                    if not has_corresponding:
+                        state_pass = False
                 if not all(x == 1 for x in local_oracle_list):
                     state_pass = False
-                state_pass_detail[(source, type)] = local_oracle_list
+                state_pass_detail[(source, type)] = [local_oracle_list, has_corresponding]
             if state_pass and result_pass:
                 pass_list.append(True)
             else:
@@ -1829,7 +1928,8 @@ class SessionEvaluator:
             test_case_pass_detail.append({
                 "result_pass": result_pass,
                 "state_pass": state_pass,
-                "state_pass_detail": state_pass_detail
+                "state_pass_detail": state_pass_detail,
+                "error_info": None
             })
         return pass_list, test_case_pass_detail
 
