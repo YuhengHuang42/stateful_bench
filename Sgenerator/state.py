@@ -8,6 +8,7 @@ import copy
 import Sgenerator.utils as utils
 USER_FUNCTION_PARAM_FLAG = "User_variable"
 RESPONSE_VARIABLE_TEMP = "response_{}"
+RESULT_NAME = "RESULT"
 INDENT = "    "
 
 @dataclass
@@ -64,7 +65,9 @@ class State:
 class Schema:
     def __init__(self):
         self.init_local_str: List[Tuple[int, str, str]] = field(default_factory=list) # [(idx, name, value)] Used for the initialization of the user-defined variables.
-    
+        self.local_states = None
+        self.implicit_states = None
+        
     @abstractmethod
     def add_local_variable(self, local_variable: Any):
         """
@@ -193,6 +196,9 @@ class Schema:
             name = f"user_constant_{len(self.init_local_str)}"
         if isinstance(value, str):    
             value = f"\"{value}\""
+        for item in self.init_local_str:
+            if item[2] == value:
+                return item[1]
         self.init_local_str.append([len(self.init_local_str), name, value])
         return name
     
@@ -248,7 +254,7 @@ class TraceGenerator:
         self.state_schema.align_initial_state()
         
         
-    def generate_trace(self, call_num, this_trace_duplicate_local_variable_map=dict(), disable_postprocess=False):
+    def generate_trace(self, call_num, this_trace_duplicate_local_variable_map=dict(), disable_postprocess=False, base_call_num=0):
         # 1. Two function calls with exact same parameters should be avoided.
         # 2. Increase pair coverage as much as possible.
         # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
@@ -272,7 +278,7 @@ class TraceGenerator:
                         producer = copy.deepcopy(self.state_schema.local_states["variables"][producer])
                     else:
                         producer = None
-                    new_transition = self.state_schema.craft_transition(transition, i + idx + 1, transition_name, producer)
+                    new_transition = self.state_schema.craft_transition(transition, i + idx + 1 + base_call_num, transition_name, producer)
                     implicit, local = new_transition.get_effected_states(self.state_schema)
                     new_transition.apply(implicit, local, self.state_schema)
                     trace.append([transition_name, copy.deepcopy(transition["required_parameters"])])
@@ -342,7 +348,7 @@ class TraceGenerator:
                 else:
                     producer = None
                 #producer_info = f"FROM local_variable_idx: {producer}, created_by: {self.state_schema.local_states['variables'][producer].created_by}"
-                new_transition = self.state_schema.craft_transition(target_transition_info, i+1, selected[0], producer)
+                new_transition = self.state_schema.craft_transition(target_transition_info, i+1+base_call_num, selected[0], producer)
                 if selected[0] not in this_trace_duplicate_local_variable_map:
                     this_trace_duplicate_local_variable_map[selected[0]] = set([])
                 this_trace_duplicate_local_variable_map[selected[0]].add(self.state_schema.transform_parameters_to_str(target_transition_info["required_parameters"]))
@@ -360,7 +366,7 @@ def generate_program(trace_generator: TraceGenerator, trace_length: int, control
     Generate a program from the trace.
     """
     
-    def synthesize_trace_str(program, trace, condition_string="", global_indent=""):
+    def synthesize_trace_str(program, trace, condition_string="", global_indent="", block_ending="\n\n"):
         if program != "":
             program += "\n" + condition_string
         else:
@@ -370,25 +376,38 @@ def generate_program(trace_generator: TraceGenerator, trace_length: int, control
             local_indent = block_info[1]
             for line in block:
                 program += global_indent + local_indent + line
-            program += "\n\n"
+            program += block_ending
+        if len(block_ending) > 0:
+            program = program[:-len(block_ending)] + "\n"
         return program
     
     trace_generator.prepare_initial_state()
     result = {
+        "init_block": None,
         "program": None,
         "main_trace": None,
         "if_trace": None,
         "else_trace": None,
         "occurence_book": None,
+        "if_statement": None,
+        "init_implict_dict": None,
     }
+    result_variable_flag = False
     if not enable_if_else:
         trace, this_trace_duplicate_local_variable_map = trace_generator.generate_trace(trace_length, disable_postprocess=False)
-        result["main_trace"] = trace
+        result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
         program = synthesize_trace_str("", trace)
         init_program = ""
+        returned_init_local_str = []
         for init_str in trace_generator.state_schema.init_local_str:
             init_program += f"{init_str[1]} = {init_str[2]}\n"
-        result["program"] = init_program + "\n" + program
+            returned_init_local_str.append((init_str[1], init_str[2]))
+        result["program"] = program
+        result["init_block"] = [init_program, returned_init_local_str]
+        result_str = trace_generator.state_schema.postprocess_choose_result()
+        if result_str is not None:
+            result["program"] += "\n" + result_str
+        result["init_implict_dict"] = trace_generator.state_schema.init_implict_dict
     else:
         #control_position = random.randint(0, trace_length - 1)
         assert control_position_candidate is not None
@@ -398,18 +417,25 @@ def generate_program(trace_generator: TraceGenerator, trace_length: int, control
             # The same as non-ifelse case.
             # Left here for diversity.
             trace, this_trace_duplicate_local_variable_map = trace_generator.generate_trace(trace_length, disable_postprocess=False)
-            result["main_trace"] = trace
+            result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
             program = synthesize_trace_str("", trace)
             init_program = ""
+            returned_init_local_str = []
             for init_str in trace_generator.state_schema.init_local_str:
                 init_program += f"{init_str[1]} = {init_str[2]}\n"
-            result["program"] = init_program + "\n" + program
+                returned_init_local_str.append((init_str[1], init_str[2]))
+            result["program"] = program
+            result["init_block"] = [init_program, returned_init_local_str]
+            result_str = trace_generator.state_schema.postprocess_choose_result()
+            if result_str is not None:
+                result["program"] += "\n" + result_str
+            result["init_implict_dict"] = trace_generator.state_schema.init_implict_dict
         else:
             program = ""
             if control_position != 0:
                 trace, this_trace_duplicate_local_variable_map = trace_generator.generate_trace(control_position, disable_postprocess=True)
                 program = synthesize_trace_str(program, trace)
-                result["main_trace"] = trace
+                result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
             else:
                 this_trace_duplicate_local_variable_map = dict()
             disable_postprocess = random.random() < 0.5
@@ -422,20 +448,40 @@ def generate_program(trace_generator: TraceGenerator, trace_length: int, control
             else_trace_generator = copy.deepcopy(trace_generator)
             if_trace, if_this_trace_duplicate_local_variable_map = if_trace_generator.generate_trace(trace_length - control_position,
                                                                                                      this_trace_duplicate_local_variable_map, 
-                                                                                                     disable_postprocess=disable_postprocess)
-            program = synthesize_trace_str(program, if_trace, if_string, INDENT)
-            result["if_trace"] = if_trace
+                                                                                                     disable_postprocess=disable_postprocess,
+                                                                                                     base_call_num=control_position)
+            program = synthesize_trace_str(program, if_trace, if_string, INDENT, block_ending="\n\n")
+            result["if_trace"] = [if_trace, if_trace_generator.state_schema.get_implicit_states()]
+            result["if_statement"] = if_string
+            if_result_str = if_trace_generator.state_schema.postprocess_choose_result()
+            if if_result_str is not None:
+                result_variable_flag = True
+                program = synthesize_trace_str(program,
+                                               [None, [([if_result_str], "")], ], 
+                                               '', 
+                                               global_indent=INDENT,
+                                               block_ending="")
             
             else_trace_generator.occurence_book = copy.deepcopy(if_trace_generator.occurence_book)
+            else_trace_generator.state_schema.init_local_str = copy.deepcopy(if_trace_generator.state_schema.init_local_str)
             
             else_trace, else_this_trace_duplicate_local_variable_map = else_trace_generator.generate_trace(trace_length - control_position,
                                                                                                            if_this_trace_duplicate_local_variable_map, 
-                                                                                                           disable_postprocess=not disable_postprocess)
-            result["else_trace"] = else_trace
+                                                                                                           disable_postprocess=not disable_postprocess,
+                                                                                                           base_call_num=control_position)
+            result["else_trace"] = [else_trace, else_trace_generator.state_schema.get_implicit_states()]
             result["occurence_book"] = copy.deepcopy(else_trace_generator.occurence_book)
             
             else_string = f"else:\n"
-            program = synthesize_trace_str(program, else_trace, else_string, INDENT)
+            program = synthesize_trace_str(program, else_trace, else_string, INDENT, block_ending="\n\n")
+            else_result_str = else_trace_generator.state_schema.postprocess_choose_result()
+            if else_result_str is not None:
+                result_variable_flag = True
+                program = synthesize_trace_str(program,
+                                               [None, [([else_result_str], "")], ], 
+                                               '', 
+                                               global_indent=INDENT,
+                                               block_ending="")
             all_init_str = []
             for init_str in if_trace_generator.state_schema.init_local_str:
                 # We do not use set because some elements might be non-hashable.
@@ -447,8 +493,11 @@ def generate_program(trace_generator: TraceGenerator, trace_length: int, control
             init_program = ""
             for init_str in all_init_str:
                 init_program += f"{init_str[0]} = {init_str[1]}\n"
-            result["program"] = init_program + "\n" + program
-            
+            if result_variable_flag:
+                init_program += f"{RESULT_NAME} = None\n"
+            result["program"] = program
+            result["init_block"] = [init_program, all_init_str]
+            result["init_implict_dict"] = else_trace_generator.state_schema.init_implict_dict
     return result
             
             
