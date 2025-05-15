@@ -64,7 +64,7 @@ class State:
 
 class Schema:
     def __init__(self):
-        self.init_local_str: List[Tuple[int, str, str]] = field(default_factory=list) # [(idx, name, value)] Used for the initialization of the user-defined variables.
+        self.init_local_info: List[Tuple[int, str, str]] = field(default_factory=list) # [(idx, name, value)] Used for the initialization of the user-defined variables.
         self.local_states = None
         self.implicit_states = None
         
@@ -191,16 +191,44 @@ class Schema:
         """
         pass
 
+    @staticmethod
+    def reverse_if_condition(value):
+        """
+        Reverse the if condition for a quoted string.
+        If value is a quoted string (e.g., '"foo"'), change the content inside the quotes.
+        Otherwise, append '_diff'.
+        """
+        assert isinstance(value, str)
+        if (len(value) >= 2) and (value[0] == value[-1]) and value[0] in ('"', "'"):
+            # Quoted string
+            inner = value[1:-1]
+            # You can make the modification more robust (e.g., add a suffix, or flip a char)
+            new_inner = inner + "_diff"
+            return value[0] + new_inner + value[-1]
+        else:
+            return value + "_diff"
+    
     def add_local_constant(self, value, name=None):
+        already_exist = False
         if name is None:
-            name = f"user_constant_{len(self.init_local_str)}"
+            name = f"user_constant_{len(self.init_local_info)}"
         if isinstance(value, str):    
             value = f"\"{value}\""
-        for item in self.init_local_str:
-            if item[2] == value:
-                return item[1]
-        self.init_local_str.append([len(self.init_local_str), name, value])
-        return name
+        for item in self.init_local_info:
+            if item[1] == value:
+                already_exist = True
+                return (item[0], already_exist)
+        self.init_local_info.append([name, value])
+        return (name, already_exist)
+    
+    @staticmethod
+    def return_init_local_info(init_local_info):
+        init_program = ""
+        returned_init_local_info = []
+        for init_str in init_local_info:
+            init_program += f"{init_str[0]} = {init_str[1]}\n"
+            returned_init_local_info.append((init_str[0], init_str[1]))
+        return init_program, returned_init_local_info
     
 class RandomInitializer:
     """
@@ -401,7 +429,7 @@ def generate_program(trace_generator: TraceGenerator,
         "if_trace": None,
         "else_trace": None,
         "occurence_book": None,
-        "if_statement": None,
+        "condition_info": None,
         "init_implict_dict": None,
         "state_schema": {
             "main": None,
@@ -421,13 +449,9 @@ def generate_program(trace_generator: TraceGenerator,
             return result, is_success
         result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
         program = synthesize_trace_str("", trace)
-        init_program = ""
-        returned_init_local_str = []
-        for init_str in trace_generator.state_schema.init_local_str:
-            init_program += f"{init_str[1]} = {init_str[2]}\n"
-            returned_init_local_str.append((init_str[1], init_str[2]))
+        init_program, returned_init_local_info = Schema.return_init_local_info(trace_generator.state_schema.init_local_info)
         result["program"] = program
-        result["init_block"] = [init_program, returned_init_local_str]
+        result["init_block"] = [init_program, returned_init_local_info]
         result_str = trace_generator.state_schema.postprocess_choose_result()
         if result_str is not None:
             result["program"] += "\n" + result_str
@@ -450,13 +474,9 @@ def generate_program(trace_generator: TraceGenerator,
                 return result, is_success
             result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
             program = synthesize_trace_str("", trace)
-            init_program = ""
-            returned_init_local_str = []
-            for init_str in trace_generator.state_schema.init_local_str:
-                init_program += f"{init_str[1]} = {init_str[2]}\n"
-                returned_init_local_str.append((init_str[1], init_str[2]))
+            init_program, returned_init_local_info = Schema.return_init_local_info(trace_generator.state_schema.init_local_info)
             result["program"] = program
-            result["init_block"] = [init_program, returned_init_local_str]
+            result["init_block"] = [init_program, returned_init_local_info]
             result_str = trace_generator.state_schema.postprocess_choose_result()
             if result_str is not None:
                 result["program"] += "\n" + result_str
@@ -479,7 +499,7 @@ def generate_program(trace_generator: TraceGenerator,
                 this_trace_duplicate_local_variable_map = dict()
             disable_postprocess = random.random() < 0.5
             if_condition = trace_generator.state_schema.obtain_if_condition()
-            if_condition_name = trace_generator.state_schema.add_local_constant(if_condition[2])
+            if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2])
             if_string = f"if {utils.get_nested_path_string(if_condition[0], if_condition[1])} == {if_condition_name}:\n"
             
             
@@ -496,7 +516,9 @@ def generate_program(trace_generator: TraceGenerator,
                 return result, is_success
             program = synthesize_trace_str(program, if_trace, if_string, INDENT, block_ending="\n\n")
             result["if_trace"] = [if_trace, if_trace_generator.state_schema.get_implicit_states()]
-            result["if_statement"] = if_string
+            result["condition_info"] = {"if_statement": if_string}
+            result["condition_info"]["if_condition_name"] = if_condition_name
+            result["condition_info"]["if_condition_value"] = if_condition[2]
             if_result_str = if_trace_generator.state_schema.postprocess_choose_result()
             if if_result_str is not None:
                 result_variable_flag = True
@@ -507,7 +529,7 @@ def generate_program(trace_generator: TraceGenerator,
                                                block_ending="")
             
             else_trace_generator.occurence_book = copy.deepcopy(if_trace_generator.occurence_book)
-            else_trace_generator.state_schema.init_local_str = copy.deepcopy(if_trace_generator.state_schema.init_local_str)
+            else_trace_generator.state_schema.init_local_info = copy.deepcopy(if_trace_generator.state_schema.init_local_info)
             
             else_trace, else_this_trace_duplicate_local_variable_map, is_success = else_trace_generator.generate_trace(trace_length - control_position,
                                                                                                            if_this_trace_duplicate_local_variable_map, 
@@ -532,13 +554,13 @@ def generate_program(trace_generator: TraceGenerator,
                                                global_indent=INDENT,
                                                block_ending="")
             all_init_str = []
-            for init_str in if_trace_generator.state_schema.init_local_str:
+            for init_str in if_trace_generator.state_schema.init_local_info:
                 # We do not use set because some elements might be non-hashable.
-                if (init_str[1], init_str[2]) not in all_init_str:
-                    all_init_str.append((init_str[1], init_str[2]))
-            for init_str in else_trace_generator.state_schema.init_local_str:
-                if (init_str[1], init_str[2]) not in all_init_str:
-                    all_init_str.append((init_str[1], init_str[2]))
+                if (init_str[0], init_str[1]) not in all_init_str:
+                    all_init_str.append((init_str[0], init_str[1]))
+            for init_str in else_trace_generator.state_schema.init_local_info:
+                if (init_str[0], init_str[1]) not in all_init_str:
+                    all_init_str.append((init_str[0], init_str[1]))
             init_program = ""
             for init_str in all_init_str:
                 init_program += f"{init_str[0]} = {init_str[1]}\n"

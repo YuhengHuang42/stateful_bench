@@ -14,7 +14,7 @@ import traceback
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
-from Sgenerator.state import INDENT, RESULT_NAME
+from Sgenerator.state import INDENT, RESULT_NAME, TraceGenerator, generate_program
 
 class SessionType(str, Enum):
     MAIN_SESSION = "main_session"
@@ -241,7 +241,7 @@ class SessionVariableSchema(Schema):
         self.local_states["variables"] = []
         self.implicit_states["sessions"] = {}
         self.implicit_states["latest_call"] = {}
-        self.init_local_str = []
+        self.init_local_info = []
         self.local_call_map = {}
         self.implicit_call_map = {}
         self.init_implict_dict = {}
@@ -376,11 +376,12 @@ class SessionVariableSchema(Schema):
         
         for idx, local_variable in enumerate(self.local_states["variables"]):
             self.add_local_constant(self.normalize_data(local_variable.value.current_value), local_variable.name)
-            #self.init_local_str.append([idx, local_variable.name, str(local_variable.value)])
+            #self.init_local_info.append([idx, local_variable.name, str(local_variable.value)])
         
         for idx, session in self.implicit_states["sessions"].items():
             self.init_implict_dict[idx] = copy.deepcopy(session.current_value)
-        
+    
+    
     def obtain_if_condition(self):
         """
         Obtain the condition for the if-else transition.
@@ -885,9 +886,10 @@ class SessionVariableSchema(Schema):
                     latest_call=calling_timestamp, 
                     created_by=USER_FUNCTION_PARAM_FLAG
                 )
-                self.add_local_variable(new_local_variable)
-                #self.init_local_str.append([len(self.local_states["variables"]) - 1, new_local_variable.name, str(new_local_variable.value)])
-                self.add_local_constant(self.normalize_data(new_local_variable.value.current_value), new_local_variable.name)
+                #self.init_local_info.append([len(self.local_states["variables"]) - 1, new_local_variable.name, str(new_local_variable.value)])
+                name, already_exist = self.add_local_constant(self.normalize_data(new_local_variable.value.current_value), new_local_variable.name)
+                if not already_exist:
+                    self.add_local_variable(new_local_variable)
                 parameters["local_variable_2_idx"] = len(self.local_states["variables"]) - 1
                 producer = copy.deepcopy(self.local_states["variables"][parameters["local_variable_2_idx"]])
         transition_class = globals()[transition]
@@ -919,20 +921,20 @@ class SessionVariableSchema(Schema):
                     #    right_str = f"{if_condition[1]}"
                     #else:
                     #    right_str = f"\"{if_condition[1]}\""
-                    init_variable_name = self.add_local_constant(if_condition[1])
-                    #self.init_local_str.append([str(idx) + "_single", init_variable_name, right_str])
+                    init_variable_name, already_exist = self.add_local_constant(if_condition[1])
+                    #self.init_local_info.append([str(idx) + "_single", init_variable_name, right_str])
                     if_condition[1] = init_variable_name
                 new_transition.add_string_parameters(if_condition, variable_name)
         elif transition == "GetSessionByQuery":
             field = transition_info["required_parameters"]["field"]
-            filed_name = self.add_local_constant(field)
+            filed_name, already_exist = self.add_local_constant(field)
             if transition_info["required_parameters"]["value_from_variable"]:
                 local_variable_idx = transition_info["local_variable_idx"]
                 local_variable = self.local_states["variables"][local_variable_idx]
                 value_name = local_variable.name + "['data'][field]"
             else:
                 value = transition_info["required_parameters"]["value"]
-                value_name = self.add_local_constant(value)
+                value_name, already_exist = self.add_local_constant(value)
             new_transition.string_parameters = {"field": filed_name, "value": value_name}
         return new_transition
     
@@ -1735,7 +1737,7 @@ class SessionEvaluator:
         self.local_environment_str = "\n".join(self.local_environment)
     
     @classmethod
-    def load(cls, file_path: str, config: Dict[str, Any]):
+    def load(cls, file_path: str, config: Dict[str, Any] = None):
         with open(file_path, "r") as f:
             saved_info = json.load(f)
         if config is None:
@@ -1752,12 +1754,12 @@ class SessionEvaluator:
         with open(file_path, "w") as f:
             json.dump(saved_info, f)
             
-    def prepare_environment(self, init_implicit_dict, init_local_list):
+    def prepare_environment(self, init_implicit_dict, init_local_info):
         source_type_pair = [set([]), set([])]
         for idx in init_implicit_dict:
             source_type_pair[0].add(init_implicit_dict[idx]["source"])
             source_type_pair[1].add(init_implicit_dict[idx]["type"])
-        for item in init_local_list:
+        for item in init_local_info:
             item_data = item[1]
             if isinstance(item_data, str):
                 # User-defined constants
@@ -1805,8 +1807,8 @@ class SessionEvaluator:
         '''
         program_info:
             "init_local_str": init_local_str
-            "init_local_list": init_local_list
-            --> Both items are retuend by result["init_block"] of function generate_program
+            "init_local_info": init_local_info
+            --> Both items are returned by result["init_block"] of function generate_program
             "init_implicit_dict": result["init_implicit_dict"]
             --> All the three items above are related to the initial state of the program.
             "end_implict_list": [session_id: state] --> Ending implicit states
@@ -1818,7 +1820,7 @@ class SessionEvaluator:
         complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
         complete_program = self.local_environment_str + "\n" + complete_program
         
-        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_list'])
+        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_info'])
         exec(complete_program, namespace)
         
         # Collect States
@@ -1830,17 +1832,20 @@ class SessionEvaluator:
         implict_list = program_info["end_implict_list"]
         source_type_pair = set([])
         for state in implict_list:
-            source_type_pair.add((state["source"], state["type"]))
+            source = state["source"]
+            type = state["type"]
+            source_type_pair.add(f"{source}||{type}")
             
-        for source, type in source_type_pair:
+        for source_type in source_type_pair:
+            source, type = source_type.split("||")
             url = f"{self.config['base_url']}/api/sessions/{source}/{type}"
             response = requests.get(url)
             response.raise_for_status()
             response_json = response.json()
             for session in response_json:
-                if (source, type) not in oracle:
-                    oracle[(source, type)] = []
-                oracle[(source, type)].append(session)
+                if source_type not in oracle:
+                    oracle[source_type] = []
+                oracle[source_type].append(session)
         
         if result is not None and "id" in result:
             result.pop("id")
@@ -1859,7 +1864,7 @@ class SessionEvaluator:
         test_case_pass_detail = []
         for idx, test_case in enumerate(self.test_cases):
             result_pass = True
-            self.prepare_environment(test_case["program_info"]["init_implicit_dict"], test_case["program_info"]["init_local_list"])
+            self.prepare_environment(test_case["program_info"]["init_implicit_dict"], test_case["program_info"]["init_local_info"])
             complete_program = test_case["program_info"]["init_local_str"] + program
             namespace = {}
             complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
@@ -1900,9 +1905,10 @@ class SessionEvaluator:
             # ====== Evaluate state oracle ======
             state_pass = True
             state_pass_detail = {}
-            for source, type in test_case["state_oracle"]:
+            for source_type in test_case["state_oracle"]:
+                source, type = source_type.split("||")
                 url = f"{self.config['base_url']}/api/sessions/{source}/{type}"
-                local_oracle_list = [0] * len(test_case["state_oracle"][(source, type)])
+                local_oracle_list = [0] * len(test_case["state_oracle"][source_type])
                 response = requests.get(url)
                 response.raise_for_status()
                 response_json = response.json()
@@ -1912,7 +1918,7 @@ class SessionEvaluator:
                     type = session["type"]
                     data = session["data"]
                     has_corresponding = False
-                    for idx, oracle_session in enumerate(test_case["state_oracle"][(source, type)]):
+                    for idx, oracle_session in enumerate(test_case["state_oracle"][source_type]):
                         if data == oracle_session["data"]:
                             local_oracle_list[idx] += 1
                             has_corresponding = True
@@ -1920,7 +1926,7 @@ class SessionEvaluator:
                         state_pass = False
                 if not all(x == 1 for x in local_oracle_list):
                     state_pass = False
-                state_pass_detail[(source, type)] = [local_oracle_list, has_corresponding]
+                state_pass_detail[source_type] = [local_oracle_list, has_corresponding]
             if state_pass and result_pass:
                 pass_list.append(True)
             else:
@@ -1933,12 +1939,136 @@ class SessionEvaluator:
             })
         return pass_list, test_case_pass_detail
 
+def generate_and_collect_test_case(trace_config,
+                                   base_url,
+                                   num_of_apis=5,
+                                   control_position_candidate=[3, 4],
+                                   occurence_book={}):
+    state_schema = SessionVariableSchema()
+    random_init = SessionRandomInitializer()
+    trace_generator = TraceGenerator(
+        state_schema,
+        random_init,
+        trace_config,
+        occurence_book
+    )
+    trace_generator.prepare_initial_state()
+    result, is_success = generate_program(trace_generator, num_of_apis, control_position_candidate)
+    occurence_book = result["occurence_book"]
+    if not is_success:
+        return None, is_success, None
+    evaluator = SessionEvaluator({"base_url": base_url})
+    implict_list = list(result['main_trace'][1].values())
+    if result["if_trace"] is not None:
+        for key in result["if_trace"][1]:
+            if key not in result['main_trace'][1]:
+                implict_list.append(result["if_trace"][1][key])
 
+    if result["else_trace"] is not None:
+        for key in result["else_trace"][1]:
+            if key not in result['main_trace'][1]:
+                implict_list.append(result["else_trace"][1][key])
+    
+    program_info = {
+            "init_local_str": result["init_block"][0],
+            "init_local_info": result["init_block"][1],
+            "init_implicit_dict": result['init_implict_dict'],
+            "end_implict_list": implict_list
+        }
+    
+    evaluator.collect_test_case(
+        program_info = program_info,
+        program = result['program']
+    )
+
+    pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+    assert pass_list[0] == True
+    
+    if result["condition_info"] is not None:
+        init_local_info_new = copy.deepcopy(result["init_block"][1])
+        idx = None
+        for idx, item in enumerate(init_local_info_new):
+            if item[0] == result["condition_info"]["if_condition_name"]:
+                break
+        init_local_info_new[idx] = (init_local_info_new[idx][0], Schema.reverse_if_condition(init_local_info_new[idx][1]))
+        init_local_str_new = Schema.return_init_local_info(init_local_info_new)[0]
+        program_info = {
+            "init_local_str": init_local_str_new,
+            "init_local_info": init_local_info_new,
+            "init_implicit_dict": result['init_implict_dict'],
+            "end_implict_list": implict_list
+        }
+        try:
+            evaluator.collect_test_case(
+                program_info = program_info,
+                program = result['program']
+            )
+            pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+            assert pass_list[0] == True
+        except Exception as e:
+            logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip.")
+        
+    return evaluator, is_success, occurence_book
+    
 if __name__ == "__main__":
+    from state import generate_program, TraceGenerator
+    idx = 0
+    occurence_book = {}
+    while idx < 40:
+        state_schema = SessionVariableSchema()
+        random_init = SessionRandomInitializer()
+
+        trace_generator = TraceGenerator(
+            state_schema,
+            random_init,
+            {
+                "init_local_state_num_range": (2, 3),
+                "init_implicit_state_num_range": (3, 6)},
+            {}
+        )
+        trace_generator.occurence_book = occurence_book
+        trace_generator.prepare_initial_state()
+        result, is_success = generate_program(trace_generator, 5, control_position_candidate=[3, 4])
+        if is_success:
+            idx += 1
+        occurence_book = result["occurence_book"]
+        
+        if not is_success:
+            continue
+        BASE_URL = "http://172.17.0.1:8080"
+
+        #evaluator = SessionEvaluator(result['init_implict_dict'], result['init_block'][1], {"base_url": BASE_URL})
+        evaluator = SessionEvaluator({"base_url": BASE_URL})
+        implict_list = list(result['main_trace'][1].values())
+        if result["if_trace"] is not None:
+            for key in result["if_trace"][1]:
+                if key not in result['main_trace'][1]:
+                    implict_list.append(result["if_trace"][1][key])
+
+        if result["else_trace"] is not None:
+            for key in result["else_trace"][1]:
+                if key not in result['main_trace'][1]:
+                    implict_list.append(result["else_trace"][1][key])
+
+        program_info = {
+                "init_local_str": result["init_block"][0],
+                "init_local_info": result["init_block"][1],
+                "init_implicit_dict": result['init_implict_dict'],
+                "end_implict_list": implict_list
+            }
+
+        evaluator.collect_test_case(
+            program_info = program_info,
+            program = result['program']
+        )
+
+        pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+        assert pass_list[0] == True
     
     # ======= Example Usage and Test Case =======
     
     # ==== Initialize the variable schema ====
+    '''
     all_state = SessionVariableSchema()
     init_variable_1 = LocalVariable(
         name="local_1",
@@ -2061,7 +2191,4 @@ if __name__ == "__main__":
     assert all_state.local_states['variables'][-1].value.current_value['source'] == "new_test"
     assert all_state.implicit_states['sessions'][1].current_value['data']['descriptions'] == "this is updated session"
     assert len(all_state.implicit_states['sessions']) == 3
-
-
-    
-    
+    '''
