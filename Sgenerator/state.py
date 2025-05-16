@@ -5,7 +5,7 @@ import random
 import numpy as np
 from loguru import logger
 import copy
-import Sgenerator.utils as utils
+from . import utils
 USER_FUNCTION_PARAM_FLAG = "User_variable"
 RESPONSE_VARIABLE_TEMP = "response_{}"
 RESULT_NAME = "RESULT"
@@ -265,7 +265,7 @@ class TraceGenerator:
         self.random_generator = random_generator
         self.config = config
         self.random_generate_config = config["random_generate_config"] if "random_generate_config" in config else {}
-        self.occurence_book = occurence_book # pair -> occurence
+        self.occurence_book = copy.deepcopy(occurence_book) # pair -> occurence
         
     def prepare_initial_state(self):
         """

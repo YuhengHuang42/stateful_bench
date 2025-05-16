@@ -17,3 +17,16 @@ def get_nested_path_string(dct_str: str, key_list: list):
         else:
             path += f'[{key}]'
     return path
+
+def get_added_changes(old_book, new_book):
+    changes = {}
+    for k, v in new_book.items():
+        if k not in old_book:
+            # New key
+            changes[k] = v
+        else:
+            assert v >= old_book[k], f"The number of occurence of {k} is decreased from {old_book[k]} to {v}."
+            # Existing key with increased value
+            if v > old_book[k]:
+                changes[k] = v - old_book[k]
+    return changes

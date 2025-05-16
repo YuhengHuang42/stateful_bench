@@ -11,10 +11,32 @@ from collections import OrderedDict
 import requests
 import json
 import traceback
+import typer
+from typing import Annotated
+from pathlib import Path
+import yaml
+import pickle
+import os
 
-from Sgenerator.utils import get_nested_path_string
-from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
-from Sgenerator.state import INDENT, RESULT_NAME, TraceGenerator, generate_program
+app = typer.Typer(pretty_exceptions_show_locals=False, pretty_exceptions_short=False)
+
+from .utils import get_nested_path_string, get_added_changes
+from .state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
+from .state import INDENT, RESULT_NAME, TraceGenerator, generate_program
+
+SESSION_SUMMARY_PROMPT = '''The below code is about a session service API provides CRUD operations for managing cBioPortal user sessions in MongoDB. 
+It supports various session types such as main sessions and virtual studies, organized by source and type parameters. 
+The API returns session objects containing ID, source, type, and data in JSON format.
+API Functions:
+Get Sessions (GET /api/sessions/{source}/{type}) - Retrieves all sessions of specified type/source
+Add Session (POST /api/sessions/{source}/{type}) - Creates new session with JSON payload
+Query Sessions (GET /api/sessions/{source}/{type}/query) - Finds sessions by field/value pair
+Advanced Query (POST /api/sessions/{source}/{type}/query/fetch) - Complex searches using MongoDB-like filters
+Session Management (GET/PUT/DELETE /api/sessions/{source}/{type}/{id}) - Get, update, or delete individual sessions
+Service Info (GET /info) - Returns basic service information
+For your descrptions, directly use {BASE_URL} to refer to the Query URL. It will be replaced later when the evaluation is performed. 
+Please be careful when describing "updates" (it is ambiguous whether it is local variable updates or remote updates through APIs).
+'''
 
 class SessionType(str, Enum):
     MAIN_SESSION = "main_session"
@@ -1735,7 +1757,7 @@ class SessionEvaluator:
             "import json",
         ]
         self.local_environment_str = "\n".join(self.local_environment)
-    
+        self.occ_book_diff = None
     @classmethod
     def load(cls, file_path: str, config: Dict[str, Any] = None):
         with open(file_path, "r") as f:
@@ -1744,12 +1766,13 @@ class SessionEvaluator:
             config = saved_info["config"]
         created_cls =  cls(config)
         created_cls.test_cases = saved_info["test_cases"]
+        created_cls.occ_book_diff = saved_info["occ_book_diff"]
         return created_cls
 
     def store(self, file_path: str):
         saved_info = {
             "test_cases": self.test_cases,
-            "config": self.config
+            "config": self.config,
         }
         with open(file_path, "w") as f:
             json.dump(saved_info, f)
@@ -1954,9 +1977,10 @@ def generate_and_collect_test_case(trace_config,
     )
     trace_generator.prepare_initial_state()
     result, is_success = generate_program(trace_generator, num_of_apis, control_position_candidate)
+    added_changes = get_added_changes(occurence_book, result["occurence_book"])
     occurence_book = result["occurence_book"]
     if not is_success:
-        return None, is_success, None
+        return None, is_success, None, None
     evaluator = SessionEvaluator({"base_url": base_url})
     implict_list = list(result['main_trace'][1].values())
     if result["if_trace"] is not None:
@@ -1976,13 +2000,17 @@ def generate_and_collect_test_case(trace_config,
             "end_implict_list": implict_list
         }
     
-    evaluator.collect_test_case(
-        program_info = program_info,
-        program = result['program']
-    )
+    try:
+        evaluator.collect_test_case(
+            program_info = program_info,
+            program = result['program']
+        )
 
-    pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
-    assert pass_list[0] == True
+        pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+        assert pass_list[0] == True
+    except Exception as e:
+        logger.warning(f"Error in generating and collecting test case: {e}, skip.")
+        return None, False, None, None
     
     if result["condition_info"] is not None:
         init_local_info_new = copy.deepcopy(result["init_block"][1])
@@ -2006,69 +2034,61 @@ def generate_and_collect_test_case(trace_config,
             pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
             assert pass_list[0] == True
         except Exception as e:
-            logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip.")
+            logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip this test case.")
         
-    return evaluator, is_success, occurence_book
+    return evaluator, is_success, occurence_book, added_changes
+
+@app.command()
+def main(
+    config_file: Annotated[Path, typer.Option()],
+    save_path: Annotated[Path, typer.Option()],
+):
+    with open(config_file, 'r') as file:
+        config_dict = yaml.safe_load(file)
+    generation_config = config_dict["generation_config"]
     
-if __name__ == "__main__":
-    from state import generate_program, TraceGenerator
-    idx = 0
+    num_of_apis = generation_config["num_of_apis"]
+    control_position_candidate = generation_config["control_position_candidate"]
+    num_of_tests = generation_config["num_of_tests"]
+    
+    base_url = config_dict["env"]["base_url"]
+    
     occurence_book = {}
-    while idx < 40:
-        state_schema = SessionVariableSchema()
-        random_init = SessionRandomInitializer()
-
-        trace_generator = TraceGenerator(
-            state_schema,
-            random_init,
-            {
-                "init_local_state_num_range": (2, 3),
-                "init_implicit_state_num_range": (3, 6)},
-            {}
+    evaluator_book = {}
+    occ_book_diff_recorder = {}
+    idx = 0
+    while idx < num_of_tests:
+        evaluator, is_success, new_occurence_book, occ_diff = generate_and_collect_test_case(
+            trace_config = generation_config["trace_config"],
+            base_url = base_url,
+            num_of_apis = num_of_apis,
+            control_position_candidate = control_position_candidate,
+            occurence_book=occurence_book
         )
-        trace_generator.occurence_book = occurence_book
-        trace_generator.prepare_initial_state()
-        result, is_success = generate_program(trace_generator, 5, control_position_candidate=[3, 4])
         if is_success:
+            occurence_book = new_occurence_book
+            occ_book_diff_recorder[idx] = occ_diff
+            evaluator_book[idx] = evaluator
             idx += 1
-        occurence_book = result["occurence_book"]
-        
-        if not is_success:
-            continue
-        BASE_URL = "http://172.17.0.1:8080"
-
-        #evaluator = SessionEvaluator(result['init_implict_dict'], result['init_block'][1], {"base_url": BASE_URL})
-        evaluator = SessionEvaluator({"base_url": BASE_URL})
-        implict_list = list(result['main_trace'][1].values())
-        if result["if_trace"] is not None:
-            for key in result["if_trace"][1]:
-                if key not in result['main_trace'][1]:
-                    implict_list.append(result["if_trace"][1][key])
-
-        if result["else_trace"] is not None:
-            for key in result["else_trace"][1]:
-                if key not in result['main_trace'][1]:
-                    implict_list.append(result["else_trace"][1][key])
-
-        program_info = {
-                "init_local_str": result["init_block"][0],
-                "init_local_info": result["init_block"][1],
-                "init_implicit_dict": result['init_implict_dict'],
-                "end_implict_list": implict_list
-            }
-
-        evaluator.collect_test_case(
-            program_info = program_info,
-            program = result['program']
-        )
-
-        pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
-        assert pass_list[0] == True
     
+    for idx in evaluator_book:
+        evaluator_save_path = os.path.join(save_path, f"evaluator_{idx}.json")
+        evaluator_book[idx].store(evaluator_save_path)
+    metadata_save_path = os.path.join(save_path, "metadata.pkl")
+    with open(metadata_save_path, 'wb') as file:
+        pickle.dump({
+            "occurence_book": occurence_book,
+            "config": config_dict,
+            "occ_book_diff_recorder": occ_book_diff_recorder
+        }, file)
+
+if __name__ == "__main__":
+    app()
+'''
+if __name__ == "__main__":
     # ======= Example Usage and Test Case =======
     
     # ==== Initialize the variable schema ====
-    '''
     all_state = SessionVariableSchema()
     init_variable_1 = LocalVariable(
         name="local_1",
@@ -2191,4 +2211,4 @@ if __name__ == "__main__":
     assert all_state.local_states['variables'][-1].value.current_value['source'] == "new_test"
     assert all_state.implicit_states['sessions'][1].current_value['data']['descriptions'] == "this is updated session"
     assert len(all_state.implicit_states['sessions']) == 3
-    '''
+'''
