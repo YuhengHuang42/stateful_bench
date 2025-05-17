@@ -1,5 +1,6 @@
 from functools import reduce
 from operator import getitem
+import json
 
 def get_nested_value(dct: dict, key_list: list):
     """Safely get nested value from dictionary using list of keys"""
@@ -30,3 +31,9 @@ def get_added_changes(old_book, new_book):
             if v > old_book[k]:
                 changes[k] = v - old_book[k]
     return changes
+
+def write_jsonl(output_path, data):
+    with open(output_path, "w") as ifile:
+        for entry in data:
+            json_line = json.dumps(entry)
+            ifile.write(json_line + '\n')

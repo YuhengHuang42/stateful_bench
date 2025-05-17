@@ -6,7 +6,8 @@ import numpy as np
 from loguru import logger
 import copy
 from . import utils
-USER_FUNCTION_PARAM_FLAG = "User_variable"
+USER_FUNCTION_PARAM_FLAG = "user_variable"
+USER_CONSTANT_FLAG = "user_constant"
 RESPONSE_VARIABLE_TEMP = "response_{}"
 RESULT_NAME = "RESULT"
 INDENT = "    "
@@ -211,7 +212,7 @@ class Schema:
     def add_local_constant(self, value, name=None):
         already_exist = False
         if name is None:
-            name = f"user_constant_{len(self.init_local_info)}"
+            name = f"{USER_CONSTANT_FLAG}_{len(self.init_local_info)}"
         if isinstance(value, str):    
             value = f"\"{value}\""
         for item in self.init_local_info:
@@ -397,6 +398,35 @@ class TraceGenerator:
         return (trace, trace_str), this_trace_duplicate_local_variable_map, True
 
 
+class ProgramEvaluator(ABC):
+    """Base class for program evaluators defining common interface"""
+    
+    @classmethod
+    @abstractmethod
+    def load(cls, file_path: str, config: Dict[str, Any] = None):
+        """Load evaluator state from file"""
+        pass
+
+    @abstractmethod
+    def store(self, file_path: str):
+        """Store evaluator state to file"""
+        pass
+
+    @abstractmethod
+    def prepare_environment(self, init_implicit_dict, init_local_info):
+        """Prepare testing environment with initial states"""
+        pass
+
+    @abstractmethod 
+    def collect_test_case(self, program_info, program):
+        """Collect a new test case for evaluation"""
+        pass
+
+    @abstractmethod
+    def evaluate(self, program: str, threshold: float = 1e-4):
+        """Evaluate program against collected test cases"""
+        pass
+    
 def generate_program(trace_generator: TraceGenerator, 
                      trace_length: int, 
                      control_position_candidate: List[int]=None, 
@@ -570,3 +600,84 @@ def generate_program(trace_generator: TraceGenerator,
             result["init_block"] = [init_program, all_init_str]
             result["init_implict_dict"] = else_trace_generator.state_schema.get_implicit_states(current_value=False)
     return result, is_success
+
+
+def generate_and_collect_test_case(
+    schema_class,
+    random_init_class,
+    evaluator_class,
+    trace_config,
+    base_url,
+    num_of_apis=5,
+    control_position_candidate=[3, 4],
+    occurence_book={}):
+    state_schema = schema_class()
+    random_init = random_init_class()
+    trace_generator = TraceGenerator(
+        state_schema,
+        random_init,
+        trace_config,
+        occurence_book
+    )
+    trace_generator.prepare_initial_state()
+    result, is_success = generate_program(trace_generator, num_of_apis, control_position_candidate)
+    added_changes = utils.get_added_changes(occurence_book, result["occurence_book"])
+    occurence_book = result["occurence_book"]
+    if not is_success:
+        return None, is_success, None, None
+    evaluator = evaluator_class({"base_url": base_url})
+    implict_list = list(result['main_trace'][1].values())
+    if result["if_trace"] is not None:
+        for key in result["if_trace"][1]:
+            if key not in result['main_trace'][1]:
+                implict_list.append(result["if_trace"][1][key])
+
+    if result["else_trace"] is not None:
+        for key in result["else_trace"][1]:
+            if key not in result['main_trace'][1]:
+                implict_list.append(result["else_trace"][1][key])
+    
+    program_info = {
+            "init_local_str": result["init_block"][0],
+            "init_local_info": result["init_block"][1],
+            "init_implicit_dict": result['init_implict_dict'],
+            "end_implict_list": implict_list
+        }
+    
+    try:
+        evaluator.collect_test_case(
+            program_info = program_info,
+            program = result['program']
+        )
+
+        pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+        assert pass_list[0] == True
+    except Exception as e:
+        logger.warning(f"Error in generating and collecting test case: {e}, skip.")
+        return None, False, None, None
+    
+    if result["condition_info"] is not None:
+        init_local_info_new = copy.deepcopy(result["init_block"][1])
+        idx = None
+        for idx, item in enumerate(init_local_info_new):
+            if item[0] == result["condition_info"]["if_condition_name"]:
+                break
+        init_local_info_new[idx] = (init_local_info_new[idx][0], Schema.reverse_if_condition(init_local_info_new[idx][1]))
+        init_local_str_new = Schema.return_init_local_info(init_local_info_new)[0]
+        program_info = {
+            "init_local_str": init_local_str_new,
+            "init_local_info": init_local_info_new,
+            "init_implicit_dict": result['init_implict_dict'],
+            "end_implict_list": implict_list
+        }
+        try:
+            evaluator.collect_test_case(
+                program_info = program_info,
+                program = result['program']
+            )
+            pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+            assert pass_list[0] == True
+        except Exception as e:
+            logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip this test case.")
+        
+    return evaluator, is_success, occurence_book, added_changes

@@ -11,18 +11,10 @@ from collections import OrderedDict
 import requests
 import json
 import traceback
-import typer
-from typing import Annotated
-from pathlib import Path
-import yaml
-import pickle
-import os
 
-app = typer.Typer(pretty_exceptions_show_locals=False, pretty_exceptions_short=False)
-
-from .utils import get_nested_path_string, get_added_changes
-from .state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
-from .state import INDENT, RESULT_NAME, TraceGenerator, generate_program
+from Sgenerator.utils import get_nested_path_string
+from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
+from Sgenerator.state import INDENT, RESULT_NAME, ProgramEvaluator
 
 SESSION_SUMMARY_PROMPT = '''The below code is about a session service API provides CRUD operations for managing cBioPortal user sessions in MongoDB. 
 It supports various session types such as main sessions and virtual studies, organized by source and type parameters. 
@@ -1740,8 +1732,8 @@ class LocalEdit(Transition):
             ]
             result = if_block + result
         return result, ""
-
-class SessionEvaluator:
+    
+class SessionEvaluator(ProgramEvaluator):
     def __init__(self, 
                  #init_implicit_dict: Dict[str, Any],
                  #init_local_list,
@@ -1766,7 +1758,6 @@ class SessionEvaluator:
             config = saved_info["config"]
         created_cls =  cls(config)
         created_cls.test_cases = saved_info["test_cases"]
-        created_cls.occ_book_diff = saved_info["occ_book_diff"]
         return created_cls
 
     def store(self, file_path: str):
@@ -1962,128 +1953,7 @@ class SessionEvaluator:
             })
         return pass_list, test_case_pass_detail
 
-def generate_and_collect_test_case(trace_config,
-                                   base_url,
-                                   num_of_apis=5,
-                                   control_position_candidate=[3, 4],
-                                   occurence_book={}):
-    state_schema = SessionVariableSchema()
-    random_init = SessionRandomInitializer()
-    trace_generator = TraceGenerator(
-        state_schema,
-        random_init,
-        trace_config,
-        occurence_book
-    )
-    trace_generator.prepare_initial_state()
-    result, is_success = generate_program(trace_generator, num_of_apis, control_position_candidate)
-    added_changes = get_added_changes(occurence_book, result["occurence_book"])
-    occurence_book = result["occurence_book"]
-    if not is_success:
-        return None, is_success, None, None
-    evaluator = SessionEvaluator({"base_url": base_url})
-    implict_list = list(result['main_trace'][1].values())
-    if result["if_trace"] is not None:
-        for key in result["if_trace"][1]:
-            if key not in result['main_trace'][1]:
-                implict_list.append(result["if_trace"][1][key])
 
-    if result["else_trace"] is not None:
-        for key in result["else_trace"][1]:
-            if key not in result['main_trace'][1]:
-                implict_list.append(result["else_trace"][1][key])
-    
-    program_info = {
-            "init_local_str": result["init_block"][0],
-            "init_local_info": result["init_block"][1],
-            "init_implicit_dict": result['init_implict_dict'],
-            "end_implict_list": implict_list
-        }
-    
-    try:
-        evaluator.collect_test_case(
-            program_info = program_info,
-            program = result['program']
-        )
-
-        pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
-        assert pass_list[0] == True
-    except Exception as e:
-        logger.warning(f"Error in generating and collecting test case: {e}, skip.")
-        return None, False, None, None
-    
-    if result["condition_info"] is not None:
-        init_local_info_new = copy.deepcopy(result["init_block"][1])
-        idx = None
-        for idx, item in enumerate(init_local_info_new):
-            if item[0] == result["condition_info"]["if_condition_name"]:
-                break
-        init_local_info_new[idx] = (init_local_info_new[idx][0], Schema.reverse_if_condition(init_local_info_new[idx][1]))
-        init_local_str_new = Schema.return_init_local_info(init_local_info_new)[0]
-        program_info = {
-            "init_local_str": init_local_str_new,
-            "init_local_info": init_local_info_new,
-            "init_implicit_dict": result['init_implict_dict'],
-            "end_implict_list": implict_list
-        }
-        try:
-            evaluator.collect_test_case(
-                program_info = program_info,
-                program = result['program']
-            )
-            pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
-            assert pass_list[0] == True
-        except Exception as e:
-            logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip this test case.")
-        
-    return evaluator, is_success, occurence_book, added_changes
-
-@app.command()
-def main(
-    config_file: Annotated[Path, typer.Option()],
-    save_path: Annotated[Path, typer.Option()],
-):
-    with open(config_file, 'r') as file:
-        config_dict = yaml.safe_load(file)
-    generation_config = config_dict["generation_config"]
-    
-    num_of_apis = generation_config["num_of_apis"]
-    control_position_candidate = generation_config["control_position_candidate"]
-    num_of_tests = generation_config["num_of_tests"]
-    
-    base_url = config_dict["env"]["base_url"]
-    
-    occurence_book = {}
-    evaluator_book = {}
-    occ_book_diff_recorder = {}
-    idx = 0
-    while idx < num_of_tests:
-        evaluator, is_success, new_occurence_book, occ_diff = generate_and_collect_test_case(
-            trace_config = generation_config["trace_config"],
-            base_url = base_url,
-            num_of_apis = num_of_apis,
-            control_position_candidate = control_position_candidate,
-            occurence_book=occurence_book
-        )
-        if is_success:
-            occurence_book = new_occurence_book
-            occ_book_diff_recorder[idx] = occ_diff
-            evaluator_book[idx] = evaluator
-            idx += 1
-    
-    for idx in evaluator_book:
-        evaluator_save_path = os.path.join(save_path, f"evaluator_{idx}.json")
-        evaluator_book[idx].store(evaluator_save_path)
-    metadata_save_path = os.path.join(save_path, "metadata.pkl")
-    with open(metadata_save_path, 'wb') as file:
-        pickle.dump({
-            "occurence_book": occurence_book,
-            "config": config_dict,
-            "occ_book_diff_recorder": occ_book_diff_recorder
-        }, file)
-
-if __name__ == "__main__":
-    app()
 '''
 if __name__ == "__main__":
     # ======= Example Usage and Test Case =======
