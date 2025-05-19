@@ -108,6 +108,15 @@ class Schema:
             max_call: the maximum call number
             duplicate_local_variable_map: a dictionary of duplicate local variable map. Transition name -> set of parameters.
             previous_transition_info: the previous transition info. (transition name, parameters)
+        Return:
+            A list of transitions.
+            Each transition is a dictionary with the following keys:
+            - required_parameters: the required parameters for the transition
+            - latest_call: the latest call number
+            - whether_updated: whether the transition updates the state
+            - producer_variable_idx: the index of the producer variable
+            - transition_pairs: the transition pairs
+            - transition_name: the name of the transition
         """
         pass
     
@@ -191,6 +200,13 @@ class Schema:
         Return the program string in line and the indent.
         """
         pass
+    
+    @abstractmethod
+    def prepare_initial_state(self):
+        """
+        Prepare the initial state for the trace generation.
+        """
+        pass
 
     @staticmethod
     def reverse_if_condition(value):
@@ -230,6 +246,18 @@ class Schema:
             init_program += f"{init_str[0]} = {init_str[1]}\n"
             returned_init_local_info.append((init_str[0], init_str[1]))
         return init_program, returned_init_local_info
+
+@dataclass
+class LocalVariable:
+    value: Any
+    name: str
+    # whether the local variable is updated before the implicit state is actually updated. E.g., those local 
+    # varibales that are updated by the local edit transition but not submitted to the backend database yet.
+    updated: bool = False  
+    latest_call: int = 0
+    exist: bool = True
+    created_by: str = None
+    is_indexed: bool = False
     
 class RandomInitializer:
     """
@@ -272,6 +300,8 @@ class TraceGenerator:
         """
         Prepare the initial state for the trace generation.
         """
+        self.state_schema.prepare_initial_state(self.random_generator, self.config, self.random_generate_config)
+        '''
         self.state_schema.clear_state()
         local_state_num = random.randint(self.config["init_local_state_num_range"][0], self.config["init_local_state_num_range"][1])
         implicit_state_num = random.randint(self.config["init_implicit_state_num_range"][0], self.config["init_implicit_state_num_range"][1])
@@ -281,7 +311,7 @@ class TraceGenerator:
             state = self.random_generator.random_generate_state(**self.random_generate_config)
             self.state_schema.add_local_variable_using_state(state, latest_call=0)
         self.state_schema.align_initial_state()
-        
+        '''
         
     def generate_trace(self, 
                        call_num, 

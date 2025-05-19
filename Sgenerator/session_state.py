@@ -14,7 +14,7 @@ import traceback
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
-from Sgenerator.state import INDENT, RESULT_NAME, ProgramEvaluator
+from Sgenerator.state import INDENT, RESULT_NAME, ProgramEvaluator, LocalVariable
 
 SESSION_SUMMARY_PROMPT = '''The below code is about a session service API provides CRUD operations for managing cBioPortal user sessions in MongoDB. 
 It supports various session types such as main sessions and virtual studies, organized by source and type parameters. 
@@ -155,7 +155,6 @@ class SessionRandomInitializer(RandomInitializer):
                 target_list.remove(exclude)
             return random.choice(target_list)
     
-
 class Session(State):
     """
     Represents a session entity from the session-service API
@@ -206,18 +205,6 @@ class Session(State):
         return_value["type"] = return_value["type"].value
         return dict(return_value)
     
-@dataclass
-class LocalVariable:
-    value: Any
-    name: str
-    # whether the local variable is updated before the implicit state is actually updated. E.g., those local 
-    # varibales that are updated by the local edit transition but not submitted to the backend database yet.
-    updated: bool = False  
-    latest_call: int = 0
-    exist: bool = True
-    created_by: str = None
-    is_indexed: bool = False
-    
 class SessionVariableSchema(Schema):
     def __init__(self):
         super().__init__()
@@ -247,6 +234,17 @@ class SessionVariableSchema(Schema):
             if isinstance(data[key], SessionType):
                 data[key] = data[key].value
         return data
+    
+    def prepare_initial_state(self, random_generator: SessionRandomInitializer, config: Dict[str, Any], random_generate_config: Dict[str, Any]):
+        self.clear_state()
+        local_state_num = random.randint(config["init_local_state_num_range"][0], config["init_local_state_num_range"][1])
+        implicit_state_num = random.randint(config["init_implicit_state_num_range"][0], config["init_implicit_state_num_range"][1])
+        for i in range(implicit_state_num):
+            self.add_implicit_variable(random_generator.random_generate_state(**random_generate_config), 0)
+        for i in range(local_state_num):
+            state = random_generator.random_generate_state(**random_generate_config)
+            self.add_local_variable_using_state(state, latest_call=0)
+        self.align_initial_state()
     
     def add_local_variable(self, local_variable: LocalVariable):
         self.local_states["variables"].append(local_variable)
@@ -952,7 +950,6 @@ class SessionVariableSchema(Schema):
             new_transition.string_parameters = {"field": filed_name, "value": value_name}
         return new_transition
     
-
 class GetSessions(Transition):
     """
     Represents a query to the session-service API
@@ -1386,6 +1383,7 @@ class UpdateSession(Transition):
     
     @staticmethod
     def get_required_parameters() -> List[str]:
+        # Data content should be lazily initialized.
         return [["source", "type", "id", "data"]]
     
     def get_effected_states(self, variable_schema: SessionVariableSchema) -> List[str]:
@@ -1652,6 +1650,7 @@ class LocalEdit(Transition):
         
     @staticmethod
     def get_required_parameters() -> List[List[str]]:
+        # Edit content should be lazily initialized.
         return [["local_variable_1_idx", "local_variable_2_idx", "meta_field", "field", "value"]] # data
     
     def get_effected_states(self, variable_schema: SessionVariableSchema) -> List[str]:

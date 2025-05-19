@@ -49,18 +49,21 @@ GENERATOR_IMPROVE_PROMPT = ''' An evaluator agent has checked the descriptions a
 EVALUATOR_PROMPT = '''
 You are a checker agent tasked with evaluating the quality of a natural language description that was generated from a sequence of API calls. Your job is to determine whether the description meets two key criteria:
 
-1.	Fidelity to the Program Logic
-	•	Does the natural language description accurately reflect all steps of the given API call sequence?
-	•	Would a developer be able to reconstruct the original program logic (or a functionally equivalent one) based solely on the description?
-	•	Are any steps missing, incorrectly described, or added?
-	• Is there any ambiguity? For example, sometimes "update" can refer to either "local update" or "remote update through APIs." 
-2.	Human-likeness and Fluency
-	•	Does the description sound natural and fluent, as if it were written by a human programmer?
-	•	Does it frame the task in a realistic scenario, avoiding robotic or overly literal translations
+1.  Fidelity to the Program Logic
+	a. Does the natural language description accurately reflect all steps of the given API call sequence?
+	b. Would a developer be able to reconstruct the original program logic (or a functionally equivalent one) based solely on the description?
+	c. Are any steps missing, incorrectly described, or added?
+	d. Is there any ambiguity? For example, sometimes "update" can refer to either "local update" or "remote update through APIs." 
+2.  Human-likeness and Fluency
+	a. Does the description sound natural and fluent, as if it were written by a human programmer?
+    b. Does the description present the task in a plausible use-case or user scenario?
+	c. Is the tone and phrasing consistent with how developers describe implementation tasks?
+3.  Redundancy
+	a. Is the description redundant? For example, if the description is too verbose or if it contains unnecessary details that could be inferred from other parts of the description.
 
 Your output should be one of the following:
-	•	If the description satisfies both criteria: <OK>
-	•	If there are any problems, output a short diagnosis and suggestions for improvement. Be concise but specific.
+	•	If the description satisfies all the criteria: <OK>
+	•	If any issues are found, provide a brief but specific diagnosis along with suggestions for improvement. Suggestions can be general (e.g., tone, structure) or targeted at a specific part of the description. Keep your feedback concise and actionable.
 
 Below is the program:
 ```
@@ -95,7 +98,7 @@ def generate_jsonl_for_openai(request_id_list,
                               message_list, 
                               output_path,
                               max_tokens=None, 
-                              model_type="gpt-4o-mini", 
+                              model_type="gpt-4.1", 
                               url="/v1/chat/completions"):
     """
     Prepare input batch data for OPENAI API
