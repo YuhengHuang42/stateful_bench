@@ -1251,6 +1251,7 @@ class GetSessionByQuery(Transition):
                 "name": self.name,
                 "parameters": self.parameters,
             })
+            state.latest_call = self.calling_timestamp
             local_variable = LocalVariable(
                 name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp) + f"[{idx}]",
                 value=copy.deepcopy(state), 
@@ -1349,6 +1350,7 @@ class GetSession(Transition):
                 "name": self.name,
                 "parameters": self.parameters,
             })
+            state.latest_call = self.calling_timestamp
             local_variable = LocalVariable(
                 name=RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp),
                 value=copy.deepcopy(state), 
@@ -1469,6 +1471,7 @@ class UpdateSession(Transition):
                 "parameters": self.parameters,
             })
             state.current_value["data"] = self.parameters["data"]
+            variable_schema.implicit_states["latest_call"][implicit_states[0]] = self.calling_timestamp
 
         for local_variable in variable_schema.local_states["variables"]:
             if local_variable.value.current_value["id"] == implicit_states[0]:
