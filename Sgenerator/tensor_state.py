@@ -39,20 +39,23 @@ class TensorRandomInitializer(RandomInitializer):
     def __init__(self):
         super().__init__()
     
-    def random_generate_state(self, variable_name: str):
+    def random_generate_state(self, dim_range=None):
         # Generate random dimensions
-        dim1 = random.randint(1, 64)
-        dim2 = random.randint(1, 64)
+        if dim_range is not None:
+            lower = dim_range[0]
+            upper = dim_range[1]
+        else:
+            lower = 1
+            upper = 64
+        dim1 = random.randint(lower, upper)
+        dim2 = random.randint(lower, upper)
         
-        dim3 = random.randint(1, 64) * 2  # Generate even number between 2 and 64
+        dim3 = random.randint(lower, upper) * 2  # Generate even number between 2 and 64
         dim4 = dim3  # Third and fourth dimensions are equal
         
         # Create tensor with random values using torch.randn
         tensor_data = torch.randn(dim1, dim2, dim3, dim4)
-        return TensorState(
-            name=variable_name,
-            data=tensor_data
-        )
+        return tensor_data
 
 class TensorState(State):
     def __init__(self,
@@ -98,6 +101,8 @@ class TensorVariableSchema(Schema):
         self.local_call_map = {}
         self.implicit_call_map = {}
         self.init_implict_dict = {}
+        self.init_tensor_counter = 0
+        self.init_weight_counter = 0
     
     def add_implicit_variable(self, implicit_variable: Any, latest_call: int):
         assert implicit_variable.identifier not in self.implicit_states["tensor_info"]
@@ -105,11 +110,41 @@ class TensorVariableSchema(Schema):
         self.implicit_states["latest_call"][implicit_variable.identifier] = latest_call
         self.init_implict_dict[implicit_variable.identifier] = implicit_variable
     
-    def add_local_variable(self, local_variable: Any):
+    def add_local_variable(self, local_variable: Any, update_implicit=False):
         self.local_states["variables"].append(local_variable)
-    
+        if update_implicit:
+            state = TensorState(
+                name=local_variable.name,
+                data=local_variable.value
+            )
+            self.add_implicit_variable(state, local_variable.latest_call)
+            
     def prepare_initial_state(self, random_generator: TensorRandomInitializer, config: Dict[str, Any], random_generate_config: Dict[str, Any]):
-        pass
+        self.clear_state()
+        
+        local_state_num = random.randint(config["init_local_state_num_range"][0], config["init_local_state_num_range"][1])
+        for i in range(local_state_num):
+            if "dim_range" in random_generate_config:
+                state = random_generator.random_generate_state(dim_range=random_generate_config["dim_range"])
+            else:
+                state = random_generator.random_generate_state()
+            tensor_name = f"user_tensor_{self.init_tensor_counter}"
+            self.init_tensor_counter += 1
+            local_variable = LocalVariable(
+                name=tensor_name,
+                value=state,
+                latest_call=0,
+                created_by=USER_FUNCTION_PARAM_FLAG,
+                updated=True
+            )
+            implicit_variable = TensorState(
+                name=tensor_name,
+                data=state
+            )
+            self.add_local_variable(local_variable, update_implicit=True)
+            #self.add_implicit_variable(implicit_variable, 0)
+            
+        self.align_initial_state()
     
     def clear_state(self):
         self.local_states["variables"] = []
@@ -118,6 +153,8 @@ class TensorVariableSchema(Schema):
         self.init_implict_dict = {}
         self.implicit_call_map = {}
         self.local_call_map = {}
+        self.init_load_info = {}
+        self.init_local_info = []
     
     def get_implicit_states(self, current_value: bool = True):
         result = {}
@@ -207,15 +244,18 @@ class TensorVariableSchema(Schema):
         # 1. Whether the transition is valid.
         # 2. whether it passes determine_whether_to_keep_pair
         # 3. Whether the transition passes duplicate_local_variable_map
-        # 4. 
+        # 4. For the same transition, if there is updated variable as its parameter, we should choose it.
         for transition in self.transitions:
             if transition.__name__ not in duplicate_local_variable_map:
                 duplicate_local_variable_map[transition.__name__] = set([])
-            for tensor_name in (self.implicit_states["tensor_info"]):
+            if transition.__name__ not in available_transitions:
+                available_transitions[transition.__name__] = []
+            for tensor_name in self.implicit_states["tensor_info"]:
                 tensor_variable = self.implicit_states["tensor_info"][tensor_name]
                 local_variable_idx = self.find_local_variable_by_name(tensor_variable.identifier)
                 local_variable = self.local_states["variables"][local_variable_idx]
                 input_shape = tensor_variable.current_value["data"].shape
+                updated = local_variable.updated
                 if transition.__name__ == "Conv2dTransition":
                     # [["input", "weight", "stride", "padding", "dilation"]]
                     # First, check if the current variables can serve as the parameters.
@@ -226,6 +266,7 @@ class TensorVariableSchema(Schema):
                             lvar_shape = lvar.value.shape
                             whether_valid, parameters = Conv2dTransition.is_possible(input_shape, lvar_shape)
                             if whether_valid:
+                                updated = updated or lvar.updated
                                 parameters["weight"] = lvar
                                 break
                     if not whether_valid:
@@ -239,11 +280,11 @@ class TensorVariableSchema(Schema):
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [transition.get_transition_pairs(tensor_variable, transition.__name__)]
+                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
+                        "whether_updated": updated,
                         "producer_variable_idx": local_variable_idx, # From where
                         "transition_pairs": transition_pairs,
                         "local_variable_idx": local_variable_idx,
@@ -259,6 +300,7 @@ class TensorVariableSchema(Schema):
                             lvar_shape = lvar.value.shape
                             whether_valid, parameters = LinearTransition.is_possible(input_shape, lvar_shape)
                             if whether_valid:
+                                updated = updated or lvar.updated
                                 parameters["weight"] = lvar
                                 break
                     if not whether_valid:
@@ -271,11 +313,11 @@ class TensorVariableSchema(Schema):
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [transition.get_transition_pairs(tensor_variable, transition.__name__)]
+                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
+                        "whether_updated": updated,
                         "producer_variable_idx": local_variable_idx, # From where
                         "transition_pairs": transition_pairs,
                         "local_variable_idx": local_variable_idx,
@@ -291,11 +333,11 @@ class TensorVariableSchema(Schema):
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [transition.get_transition_pairs(tensor_variable, transition.__name__)]
+                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
+                        "whether_updated": updated,
                         "producer_variable_idx": local_variable_idx, # From where
                         "transition_pairs": transition_pairs,
                         "local_variable_idx": local_variable_idx,
@@ -311,11 +353,11 @@ class TensorVariableSchema(Schema):
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [transition.get_transition_pairs(tensor_variable, transition.__name__)]
+                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
+                        "whether_updated": updated,
                         "producer_variable_idx": local_variable_idx, # From where
                         "transition_pairs": transition_pairs,
                         "local_variable_idx": local_variable_idx,
@@ -325,17 +367,17 @@ class TensorVariableSchema(Schema):
                     whether_valid, parameters = SplitTransition.generate_valid_parameters(input_shape)
                     if not whether_valid:
                         continue
-                    parameters["tensor"] = local_variable
+                    parameters["input"] = local_variable
                     parameters_str = self.transform_parameters_to_str(parameters)
                     if parameters_str in duplicate_local_variable_map[transition.__name__]:
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [transition.get_transition_pairs(tensor_variable, transition.__name__)]
+                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
+                        "whether_updated": updated,
                         "producer_variable_idx": local_variable_idx, # From where
                         "transition_pairs": transition_pairs,
                         "local_variable_idx": local_variable_idx,
@@ -348,6 +390,7 @@ class TensorVariableSchema(Schema):
                         lvar_shape = lvar.value.shape
                         whether_valid, parameters = CatTransition.is_possible(input_shape, lvar_shape)
                         if whether_valid:
+                            updated = updated or lvar.updated
                             parameters["tensors"] = [local_variable, lvar]
                             break
                     if not whether_valid:
@@ -361,25 +404,137 @@ class TensorVariableSchema(Schema):
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [transition.get_transition_pairs(tensor_variable, transition.__name__)]
+                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
-                        "whether_updated": local_variable.updated,
+                        "whether_updated": updated,
                         "producer_variable_idx": local_variable_idx, # From where
                         "transition_pairs": transition_pairs,
                         "local_variable_idx": local_variable_idx,
                     }
                     available_transitions[transition.__name__].append(target_parameters)
         
+        # For the same transition, if there is updated variable as its parameter, we should choose it.
+        for transition_name in available_transitions:
+            this_transition_updated = []
+            for target_parameters in available_transitions[transition_name]:
+                if target_parameters["whether_updated"]:
+                    this_transition_updated.append(target_parameters)
+            if len(this_transition_updated) > 0:
+                available_transitions[transition_name] = this_transition_updated
         return available_transitions
-                        
-            
-            
-        
-        
-        
 
+    def create_new_init_tensor(self, param_name, param_value):
+        if "weight" in param_name:
+            name = f"user_weight_{self.init_weight_counter}"
+            self.init_weight_counter += 1
+        else:
+            name = f"user_tensor_{self.init_tensor_counter}"
+            self.init_tensor_counter += 1
+        # TODO: Update this.
+        # maintain the load info data structure.
+        implicit_variable = TensorState(name, param_value)
+        assert name not in self.implicit_states["tensor_info"]
+        self.add_implicit_variable(implicit_variable, 0)
+        local_variable = LocalVariable(
+            name=name,
+            value=param_value,
+            latest_call=0,
+            created_by=f"user",
+            updated=False # It will be referenced by the transition, so we set it to False.
+        )
+        self.add_local_variable(local_variable)
+        # Add init_load_info
+        self.init_load_info[name] = param_value
+        return local_variable
+        
+        
+    def craft_transition(self, transition_info, calling_timestamp, transition, producer="None"):
+        # Creating new local variables if necessary
+        # Creating transition classes using transition_class = globals()[transition]
+        # Update producer
+        if producer == "None":
+            producer = self.local_states["variables"][transition_info["producer_variable_idx"]]
+            
+        parameters = transition_info["required_parameters"]
+        parameters_name = list(parameters.keys())
+        for param_name in parameters_name:
+            param_value = parameters[param_name]
+            if isinstance(param_value, torch.Tensor):
+                # Create a new local variable.
+                new_local_variable = self.create_new_init_tensor(param_name, param_value)
+                parameters[param_name] = new_local_variable
+            if isinstance(param_value, List) or isinstance(param_value, Tuple):
+                for idx, item in enumerate(param_value):
+                    if isinstance(item, torch.Tensor):
+                        new_local_variable = self.create_new_init_tensor(f"{param_name}_{idx}", item)
+                        param_value[idx] = new_local_variable
+                parameters[param_name] = param_value
+                
+        transition_class = globals()[transition]
+        new_transition = transition_class(
+            parameters=parameters, 
+            calling_timestamp=calling_timestamp
+        )
+        new_transition.producer = producer
+        return new_transition
+
+    def postprocess_transitions(self, remaining_call: int) -> Tuple[bool, List[str]]:
+        '''
+        No need to postprocess. We do not have remote database to be updated.
+        '''
+        return False, []
+    
+    def postprocess_choose_result(self):
+        result_str = None
+        for idx in range(len(self.local_states["variables"])-1, -1, -1):
+            local_variable = self.local_states["variables"][idx]
+            transitions = local_variable.value.transitions
+            if local_variable.updated == True:
+                # Either being updated or being queried.
+                result_str = f"{RESULT_NAME} = {local_variable.name}"
+                break
+        return result_str
+    
+    def obtain_if_condition(self):
+        """
+        Obtain the condition for the if-else transition.
+         (left_variable_name, index, right_value)
+         Return:
+            if_condition: The condition for the if-else transition.
+            whether_replace_by_variable: Whether the if-else transition is replaced by a variable.
+        """
+        condition_types = [
+            'shape', 'value', 'dtype'
+        ]
+        shape_sub_types = ["single", "all", "every"]
+        if_condition = None
+        whether_replace_by_variable = True
+        for idx in range(len(self.local_states["variables"])-1, -1, -1):
+            local_var = self.local_states["variables"][idx]
+            
+            tensor = local_var.value
+            
+            cond_type = random.choice(condition_types)
+            
+            if cond_type == 'shape':
+                shape_sub_type = random.choice(shape_sub_types)
+                if shape_sub_type == "single":
+                    single_dim = random.randint(0, len(tensor.shape)-1)
+                    if_condition = (f"{local_var.name}.shape", [single_dim], tensor.shape[single_dim])
+                elif shape_sub_type == "all":
+                    if_condition = (f"len({local_var.name}.shape)", None, len(tensor.shape))
+                elif shape_sub_type == "every":
+                    if_condition = (f"list({local_var.name}.shape)", None, list(tensor.shape))
+            elif cond_type == "dtype":
+                if_condition = (f"str({local_var.name}.dtype)", None, str(tensor.dtype))
+            elif cond_type == "value":
+                right_value = torch.sum(tensor > torch.mean(tensor)).item()
+                if_condition = (f"torch.sum({local_var.name} > torch.mean({local_var.name}))", None, right_value)
+            
+        return if_condition, whether_replace_by_variable
+    
 class Conv2dTransition(Transition):
     """Handles tensor concatenation"""
     def __init__(self, parameters: Dict[str, Any], calling_timestamp: int):
@@ -392,7 +547,7 @@ class Conv2dTransition(Transition):
         assert "stride" in parameters
         assert isinstance(parameters["stride"], int)
         assert "padding" in parameters
-        assert isinstance(parameters["padding"], int)
+        assert isinstance(parameters["padding"], int) or isinstance(parameters["padding"], str)
         assert "dilation" in parameters
         assert isinstance(parameters["dilation"], int)
         
@@ -456,12 +611,14 @@ class Conv2dTransition(Transition):
 
     def get_program_str(self) -> Tuple[List[str], str]:
         result = [
-            f"{self.new_variable_name} = torch.nn.functional.conv2d({self.parameters['input'].name}, {self.parameters['weight'].name}, stride={self.parameters['stride']}, padding={self.parameters['padding']}, dilation={self.parameters['dilation']}) # shape: {self.string_parameters['shape']}\n",
+            f"{self.new_variable_name} = torch.nn.functional.conv2d({self.parameters['input'].name}, {self.parameters['weight'].name}, stride={self.parameters['stride']}, padding={self.parameters['padding']}, dilation={self.parameters['dilation']}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
 
     @staticmethod
     def calculate_valid_parameters(input_shape: Tuple[int]):
+        if len(input_shape) != 4:
+            return None
         _, in_channels, in_height, in_width = input_shape
         max_kernel = min(MAX_KERNEL_SIZE, in_height, in_width) # input is 224x224 --> 7*7
         valid_ranges = {
@@ -492,20 +649,30 @@ class Conv2dTransition(Transition):
         Given input shape, generate valid parameters for conv2d.
         '''
         valid_range = Conv2dTransition.calculate_valid_parameters(input_shape)
+        if valid_range is None:
+            return False, None
         _, _, in_height, in_width = input_shape
         max_attempts = 10  # Prevent infinite loops
         valid_found = False
         
         for _ in range(max_attempts):
             # Generate parameters with constraints
-            out_channels = random.randint(
-                valid_range['weight']['min_channels'],
-                valid_range['weight']['max_channels']
-            )
-            dilation = random.randint(
-                valid_range['dilation']['min'],
-                valid_range['dilation']['max']
-            )
+            if valid_range['weight']['min_channels'] == valid_range['weight']['max_channels']:
+                out_channels = valid_range['weight']['min_channels']
+            else:
+                out_channels = random.randint(
+                    valid_range['weight']['min_channels'],
+                    valid_range['weight']['max_channels']
+                )
+            if valid_range['dilation']['min'] == valid_range['dilation']['max']:
+                dilation = valid_range['dilation']['min']
+            elif valid_range['dilation']['min'] < valid_range['dilation']['max']:
+                dilation = random.randint(
+                    valid_range['dilation']['min'],
+                    valid_range['dilation']['max']
+                )
+            else:
+                return False, None
             
             # Calculate max kernel size considering dilation
             max_kernel_h = (in_height - 1) // dilation + 1
@@ -527,10 +694,14 @@ class Conv2dTransition(Transition):
                 pad_h = (kernel_size[0] - 1) * dilation // 2
                 pad_w = (kernel_size[1] - 1) * dilation // 2
             else:  # 'valid'
-                stride = random.randint(
-                    valid_range['stride']['min'],
-                    min(valid_range['stride']['max'], in_height, in_width)
-                )
+                max_stride = min(valid_range['stride']['max'], in_height, in_width)
+                if valid_range['stride']['min'] == max_stride:
+                    stride = valid_range['stride']['min']
+                else:
+                    stride = random.randint(
+                        valid_range['stride']['min'],
+                        max_stride
+                    )
                 pad_h = 0
                 pad_w = 0
                 
@@ -583,7 +754,13 @@ class Conv2dTransition(Transition):
         # Generate dilation (1 to max that fits in input)
         max_dilationH = (inH - 1) // (kH - 1) if kH > 1 else 1
         max_dilationW = (inW - 1) // (kW - 1) if kW > 1 else 1
-        dilation = random.randint(1, min(max_dilationH, max_dilationW))
+        min_dilation = min(max_dilationH, max_dilationW)
+        if min_dilation < 1:
+            return False, None
+        elif min_dilation == 1:
+            dilation = 1
+        else:
+            dilation = random.randint(1, min_dilation)
         
         # Calculate minimal required padding
         def calc_pad(in_dim, k_size):
@@ -660,7 +837,7 @@ class PermuteTransition(Transition):
     
     def get_program_str(self) -> Tuple[List[str], str]:
         result = [
-            f"{self.new_variable_name} = torch.permute({self.parameters['input'].name}, {self.parameters['dims']}) # shape: {self.string_parameters['shape']}\n",
+            f"{self.new_variable_name} = torch.permute({self.parameters['input'].name}, {self.parameters['dims']}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
     
@@ -687,7 +864,25 @@ class PermuteTransition(Transition):
         
         return True, {'dims': tuple(dims)}
     
-    
+    @staticmethod
+    def generate_valid_parameters(input_shape: Tuple[int]):
+        """Generate valid dimension permutation parameters"""
+        ndim = len(input_shape)
+        
+        if ndim < 2:
+            return False, None
+            
+        # Generate a random permutation of dimensions
+        dims = list(range(ndim))
+        random.shuffle(dims)
+        
+        # Ensure permutation is different from original
+        if dims == list(range(ndim)):
+            # Swap two random dimensions if we got the original order
+            i, j = random.sample(range(ndim), 2)
+            dims[i], dims[j] = dims[j], dims[i]
+        
+        return True, {'dims': tuple(dims)}
 
 class SplitTransition(Transition):
     """Handles tensor splitting"""
@@ -695,7 +890,7 @@ class SplitTransition(Transition):
         assert "input" in parameters
         assert isinstance(parameters["input"], LocalVariable)
         assert "split_size_or_sections" in parameters
-        assert isinstance(parameters["split_size_or_sections"], Union[int, List[int], Tuple[int]])
+        #assert isinstance(parameters["split_size_or_sections"], Union[int, List[int], Tuple[int]])
         assert "dim" in parameters
         super().__init__("split", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
@@ -823,10 +1018,13 @@ class CatTransition(Transition):
     def get_effected_states(self, variable_schema: TensorVariableSchema) -> List[str]:
         local_states = []
         implicit_states = []
-        for local_idx in range(len(variable_schema.local_states["variables"])-1, -1, -1):
-            tensor_name = variable_schema.local_states["variables"][local_idx].name
-            if tensor_name in self.parameters["tensors"]:
-                local_states.append(local_idx)
+        target_tensor_names = [item.name for item in self.parameters["tensors"]]
+        for tensor_name in target_tensor_names:
+            for local_idx in range(len(variable_schema.local_states["variables"])-1, -1, -1):
+                c_name = variable_schema.local_states["variables"][local_idx].name
+                if c_name == tensor_name:
+                    local_states.append(local_idx)
+                    break
             implicit_states.append(variable_schema.implicit_states["tensor_info"][tensor_name])
         return implicit_states, local_states
 
@@ -838,7 +1036,12 @@ class CatTransition(Transition):
             variable_schema.implicit_states["latest_call"][state.identifier] = self.calling_timestamp
             if len(state.transitions) > len(longest_transitions):
                 longest_transitions = copy.deepcopy(state.transitions)
-        new_tensor_value = torch.cat(input_tensors, self.parameters["dim"])
+        try:
+            new_tensor_value = torch.cat(input_tensors, self.parameters["dim"])
+        except Exception as e:
+            for idx, item in enumerate(local_states):
+                logger.error(f"Local state name: {variable_schema.local_states['variables'][item].name}, value: {variable_schema.local_states['variables'][item].value.shape}")
+            raise Exception(f"Error in cat transition: {e}")
         self.string_parameters["shape"] = new_tensor_value.shape
         new_tensor = TensorState(self.new_variable_name, new_tensor_value)
         
@@ -870,7 +1073,7 @@ class CatTransition(Transition):
             input_parameters += f"{tensor.name}, "
         input_parameters = input_parameters[:-2] + ")"
         result = [
-            f"{self.new_variable_name} = torch.cat({input_parameters}, {self.parameters['dim']}) # shape: {self.string_parameters['shape']}\n",
+            f"{self.new_variable_name} = torch.cat({input_parameters}, {self.parameters['dim']}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
 
@@ -901,7 +1104,31 @@ class CatTransition(Transition):
         # Randomly select a valid dimension
         selected_dim = random.choice(valid_dims)
         return True, {'dim': selected_dim}
-    
+
+    @staticmethod
+    def is_possible(shape1: Tuple[int], shape2: Tuple[int]):
+        """
+        Check if two tensors can be concatenated along any dimension.
+        Returns: (success, parameters) where parameters contains 'dim' if successful
+        """
+        if len(shape1) != len(shape2):
+            return False, None
+
+        valid_dims = []
+        for dim in range(len(shape1)):
+            valid = True
+            for i in range(len(shape1)):
+                if i != dim and shape1[i] != shape2[i]:
+                    valid = False
+                    break
+            if valid:
+                valid_dims.append(dim)
+
+        if not valid_dims:
+            return False, None
+
+        return True, {'dim': random.choice(valid_dims)}
+
 
 class LinearTransition(Transition):
     """Handles linear transformation"""
@@ -962,7 +1189,7 @@ class LinearTransition(Transition):
     
     def get_program_str(self) -> Tuple[List[str], str]:
         result = [
-            f"{self.new_variable_name} = torch.nn.functional.linear({self.parameters['input'].name}, {self.parameters['weight'].name}) # shape: {self.string_parameters['shape']}\n",
+            f"{self.new_variable_name} = torch.nn.functional.linear({self.parameters['input'].name}, {self.parameters['weight'].name}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
 
@@ -1083,7 +1310,7 @@ class TransposeTransition(Transition):
         ndim = len(input_shape)
         
         if ndim < 2:
-            raise ValueError("Input tensor must have at least 2 dimensions for transposition")
+            return False, None
             
         # Randomly select two distinct dimensions
         #dims = random.sample(range(ndim), 2)
@@ -1100,7 +1327,7 @@ class TransposeTransition(Transition):
     
     def get_program_str(self) -> Tuple[List[str], str]:
         result = [
-            f"{self.new_variable_name} = torch.transpose({self.parameters['input'].name}, {self.parameters['dim0']}, {self.parameters['dim1']}) # shape: {self.string_parameters['shape']}\n",
+            f"{self.new_variable_name} = torch.transpose({self.parameters['input'].name}, {self.parameters['dim0']}, {self.parameters['dim1']}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
     

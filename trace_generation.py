@@ -21,13 +21,13 @@ def main(
     num_of_apis = generation_config["num_of_apis"]
     control_position_candidate = generation_config["control_position_candidate"]
     num_of_tests = generation_config["num_of_tests"]
-    
-    base_url = config_dict["env"]["base_url"]
+
     if trace_save_path is None:
         trace_save_path = config_dict["env"]["trace_save_path"]
     
     if config_dict["task"] == "session":
         from Sgenerator.session_state import SessionEvaluator, SessionRandomInitializer, SessionVariableSchema
+        base_url = config_dict["env"]["base_url"]
         schema_class = SessionVariableSchema
         random_init_class = SessionRandomInitializer
         evaluator_class = SessionEvaluator

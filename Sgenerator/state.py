@@ -68,6 +68,7 @@ class Schema:
         self.init_local_info: List[Tuple[int, str, str]] = field(default_factory=list) # [(idx, name, value)] Used for the initialization of the user-defined variables.
         self.local_states = None
         self.implicit_states = None
+        self.init_load_info = None
         
     @abstractmethod
     def add_local_variable(self, local_variable: Any):
@@ -193,7 +194,14 @@ class Schema:
         Return a tuple of (whether to enter the postprocessing stage, list of transitions for the postprocessing stage).
         """
         pass
-
+    
+    @abstractmethod
+    def postprocess_choose_result(self):
+        """
+        Postprocess the program state to set the leaf of the data flow graph as the result.
+        """
+        pass
+    
     @abstractmethod
     def get_program_str(self) -> Tuple[List[str], str]:
         """
@@ -215,15 +223,23 @@ class Schema:
         If value is a quoted string (e.g., '"foo"'), change the content inside the quotes.
         Otherwise, append '_diff'.
         """
-        assert isinstance(value, str)
-        if (len(value) >= 2) and (value[0] == value[-1]) and value[0] in ('"', "'"):
-            # Quoted string
-            inner = value[1:-1]
-            # You can make the modification more robust (e.g., add a suffix, or flip a char)
-            new_inner = inner + "_diff"
-            return value[0] + new_inner + value[-1]
+        if isinstance(value, str):
+            if (len(value) >= 2) and (value[0] == value[-1]) and value[0] in ('"', "'"):
+                # Quoted string
+                inner = value[1:-1]
+                # You can make the modification more robust (e.g., add a suffix, or flip a char)
+                new_inner = inner + "_diff"
+                return value[0] + new_inner + value[-1]
+            else:
+                return value + "_diff"
+        elif isinstance(value, tuple) or isinstance(value, list):
+            new_value = [i for i in value]
+            new_value.append(value[0])
+            return new_value
+        elif isinstance(value, int) or isinstance(value, float):
+            return value + 1
         else:
-            return value + "_diff"
+            raise ValueError(f"Unsupported type: {type(value)}")
     
     def add_local_constant(self, value, name=None):
         already_exist = False
@@ -558,9 +574,15 @@ def generate_program(trace_generator: TraceGenerator,
             else:
                 this_trace_duplicate_local_variable_map = dict()
             disable_postprocess = random.random() < 0.5
-            if_condition = trace_generator.state_schema.obtain_if_condition()
-            if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2])
-            if_string = f"if {utils.get_nested_path_string(if_condition[0], if_condition[1])} == {if_condition_name}:\n"
+            if_condition, whether_replace_by_variable = trace_generator.state_schema.obtain_if_condition()
+            if whether_replace_by_variable:
+                if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2])
+            else:
+                if_condition_name = if_condition[2]
+            if isinstance(if_condition[1], tuple) or isinstance(if_condition[1], list):
+                if_string = f"if {utils.get_nested_path_string(if_condition[0], if_condition[1])} == {if_condition_name}:\n"
+            else:
+                if_string = f"if {if_condition[0]} == {if_condition_name}:\n"
             
             
             if_trace_generator = copy.deepcopy(trace_generator)
@@ -637,10 +659,11 @@ def generate_and_collect_test_case(
     random_init_class,
     evaluator_class,
     trace_config,
-    base_url,
     num_of_apis=5,
     control_position_candidate=[3, 4],
-    occurence_book={}):
+    occurence_book={},
+    base_url=None # Only used for Session
+    ):
     state_schema = schema_class()
     random_init = random_init_class()
     trace_generator = TraceGenerator(

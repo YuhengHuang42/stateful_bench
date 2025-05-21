@@ -254,11 +254,16 @@ class SessionVariableSchema(Schema):
         self.implicit_states["sessions"] = {}
         self.implicit_states["latest_call"] = {}
         self.init_local_info = []
+        self.init_load_info = []
         self.local_call_map = {}
         self.implicit_call_map = {}
         self.init_implict_dict = {}
         
-    def add_local_variable_using_state(self, state: Session, latest_call=0, updated=True, created_by=USER_FUNCTION_PARAM_FLAG):
+    def add_local_variable_using_state(self, 
+                                       state: Session, 
+                                       latest_call=0, 
+                                       updated=True, 
+                                       created_by=USER_FUNCTION_PARAM_FLAG):
         local_variable = LocalVariable(
             name=created_by+f"_{len(self.local_states['variables'])}",
             value=state,
@@ -397,6 +402,9 @@ class SessionVariableSchema(Schema):
     def obtain_if_condition(self):
         """
         Obtain the condition for the if-else transition.
+        Return:
+            if_condition: The condition for the if-else transition.
+            whether_replace_by_variable: Whether the if-else transition is replaced by a variable.
         """
         if_condition = None
         for idx in range(len(self.local_states["variables"])-1, -1, -1):
@@ -439,7 +447,7 @@ class SessionVariableSchema(Schema):
                 field = random.choice(list(local_variable.value.current_value["data"].keys()))  
                 if_condition = (local_variable.name, ("data", field), local_variable.value.current_value["data"][field])
                 break
-        return if_condition
+        return if_condition, True
             
                 
     
@@ -692,7 +700,7 @@ class SessionVariableSchema(Schema):
                 if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
                     duplicate_str = self.transform_parameters_to_str(target_parameters)
                     if duplicate_str not in duplicate_local_variable_map[transition.__name__]:
-                        duplicate_local_variable_map[transition.__name__].add(duplicate_str)
+                        #duplicate_local_variable_map[transition.__name__].add(duplicate_str)
                         available_transitions[transition.__name__].append({
                             "required_parameters": target_parameters,
                             "latest_call": local_variable.latest_call,
@@ -722,7 +730,7 @@ class SessionVariableSchema(Schema):
                         if self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, target_parameters)):
                             duplicate_str = self.transform_parameters_to_str(target_parameters)
                             if duplicate_str not in duplicate_local_variable_map[transition.__name__]:
-                                duplicate_local_variable_map[transition.__name__].add(duplicate_str)
+                                #duplicate_local_variable_map[transition.__name__].add(duplicate_str)
                                 available_transitions[transition.__name__].append({
                                     "required_parameters": target_parameters,
                                     "latest_call": local_variable.latest_call,
@@ -873,7 +881,7 @@ class SessionVariableSchema(Schema):
                                 "transition_pairs": transition_pairs,
                                 "local_variable_idx": idx,
                             })
-                            duplicate_local_variable_map[transition.__name__].add(duplicate_str)
+                            #duplicate_local_variable_map[transition.__name__].add(duplicate_str)
         return available_transitions
     
     def craft_transition(self, transition_info, calling_timestamp, transition, producer="None"):
