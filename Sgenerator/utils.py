@@ -37,3 +37,20 @@ def write_jsonl(output_path, data):
         for entry in data:
             json_line = json.dumps(entry)
             ifile.write(json_line + '\n')
+
+def merge_dicts(*dicts):
+    """
+    Merge multiple dictionaries into a single dictionary.
+    If there are duplicate keys, the value from the later dictionary will override the earlier one.
+    
+    Args:
+        *dicts: Variable number of dictionaries to merge
+        
+    Returns:
+        dict: Merged dictionary
+    """
+    result = {}
+    for d in dicts:
+        if d is not None:
+            result.update(d)
+    return result

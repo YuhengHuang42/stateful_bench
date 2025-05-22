@@ -216,6 +216,14 @@ class Schema:
         """
         pass
 
+    @abstractmethod
+    def get_load_info(self, init_load_info=None):
+        """
+        Get the load info for the trace generation.
+        Return: program_string, list of (variable_name, variable_value)
+        """
+        pass
+
     @staticmethod
     def reverse_if_condition(value):
         """
@@ -328,7 +336,17 @@ class TraceGenerator:
             self.state_schema.add_local_variable_using_state(state, latest_call=0)
         self.state_schema.align_initial_state()
         '''
+    
+    def copy_if_state(self, if_trace_generator):
+        self.occurence_book = copy.deepcopy(if_trace_generator.occurence_book)
+        self.state_schema.init_local_info = copy.deepcopy(if_trace_generator.state_schema.init_local_info)
+        if hasattr(if_trace_generator.state_schema, "init_load_info"):
+            self.state_schema.init_load_info = copy.deepcopy(if_trace_generator.state_schema.init_load_info)
+        if hasattr(if_trace_generator.state_schema, "init_tensor_counter"):
+            self.state_schema.init_tensor_counter = copy.deepcopy(if_trace_generator.state_schema.init_tensor_counter)
+            self.state_schema.init_weight_counter = copy.deepcopy(if_trace_generator.state_schema.init_weight_counter)
         
+    
     def generate_trace(self, 
                        call_num, 
                        this_trace_duplicate_local_variable_map=dict(), 
@@ -459,7 +477,7 @@ class ProgramEvaluator(ABC):
         pass
 
     @abstractmethod
-    def prepare_environment(self, init_implicit_dict, init_local_info):
+    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
         """Prepare testing environment with initial states"""
         pass
 
@@ -499,6 +517,7 @@ def generate_program(trace_generator: TraceGenerator,
     
     trace_generator.prepare_initial_state()
     result = {
+        "init_load_info": None,
         "init_block": None,
         "program": None,
         "main_trace": None,
@@ -528,6 +547,7 @@ def generate_program(trace_generator: TraceGenerator,
         init_program, returned_init_local_info = Schema.return_init_local_info(trace_generator.state_schema.init_local_info)
         result["program"] = program
         result["init_block"] = [init_program, returned_init_local_info]
+        result["init_load_info"] = trace_generator.state_schema.get_load_info()
         result_str = trace_generator.state_schema.postprocess_choose_result()
         if result_str is not None:
             result["program"] += "\n" + result_str
@@ -553,6 +573,7 @@ def generate_program(trace_generator: TraceGenerator,
             init_program, returned_init_local_info = Schema.return_init_local_info(trace_generator.state_schema.init_local_info)
             result["program"] = program
             result["init_block"] = [init_program, returned_init_local_info]
+            result["init_load_info"] = trace_generator.state_schema.get_load_info()
             result_str = trace_generator.state_schema.postprocess_choose_result()
             if result_str is not None:
                 result["program"] += "\n" + result_str
@@ -610,8 +631,9 @@ def generate_program(trace_generator: TraceGenerator,
                                                global_indent=INDENT,
                                                block_ending="")
             
-            else_trace_generator.occurence_book = copy.deepcopy(if_trace_generator.occurence_book)
-            else_trace_generator.state_schema.init_local_info = copy.deepcopy(if_trace_generator.state_schema.init_local_info)
+            #else_trace_generator.occurence_book = copy.deepcopy(if_trace_generator.occurence_book)
+            #else_trace_generator.state_schema.init_local_info = copy.deepcopy(if_trace_generator.state_schema.init_local_info)
+            else_trace_generator.copy_if_state(if_trace_generator)
             
             else_trace, else_this_trace_duplicate_local_variable_map, is_success = else_trace_generator.generate_trace(trace_length - control_position,
                                                                                                            if_this_trace_duplicate_local_variable_map, 
@@ -648,6 +670,13 @@ def generate_program(trace_generator: TraceGenerator,
                 init_program += f"{init_str[0]} = {init_str[1]}\n"
             if result_variable_flag:
                 init_program += f"{RESULT_NAME} = None\n"
+            
+            # For loaded variables.
+            init_load_info_dict = utils.merge_dicts(if_trace_generator.state_schema.init_load_info, 
+                                               else_trace_generator.state_schema.init_load_info)
+            if len(init_load_info_dict) > 0:
+                result["init_load_info"] = else_trace_generator.state_schema.get_load_info(init_load_info_dict)
+                        
             result["program"] = program
             result["init_block"] = [init_program, all_init_str]
             result["init_implict_dict"] = else_trace_generator.state_schema.get_implicit_states(current_value=False)
@@ -662,7 +691,7 @@ def generate_and_collect_test_case(
     num_of_apis=5,
     control_position_candidate=[3, 4],
     occurence_book={},
-    base_url=None # Only used for Session
+    evaluation_config={}
     ):
     state_schema = schema_class()
     random_init = random_init_class()
@@ -678,36 +707,45 @@ def generate_and_collect_test_case(
     occurence_book = result["occurence_book"]
     if not is_success:
         return None, is_success, None, None
-    evaluator = evaluator_class({"base_url": base_url})
-    implict_list = list(result['main_trace'][1].values())
+
+    evaluator = evaluator_class(evaluation_config)
+
+    if result["main_trace"] is None:
+        implict_list = []
+    else:
+        implict_list = list(result['main_trace'][1].values())
     if result["if_trace"] is not None:
         for key in result["if_trace"][1]:
-            if key not in result['main_trace'][1]:
+            if result["main_trace"] is None or key not in result['main_trace'][1]:
                 implict_list.append(result["if_trace"][1][key])
 
     if result["else_trace"] is not None:
         for key in result["else_trace"][1]:
-            if key not in result['main_trace'][1]:
+            if result["main_trace"] is None or key not in result['main_trace'][1]:
                 implict_list.append(result["else_trace"][1][key])
     
     program_info = {
             "init_local_str": result["init_block"][0],
             "init_local_info": result["init_block"][1],
             "init_implicit_dict": result['init_implict_dict'],
-            "end_implict_list": implict_list
+            "end_implict_list": implict_list,
+            "init_load_str": result["init_load_info"][0] if result["init_load_info"] is not None else None,
+            "init_load_info": result["init_load_info"][1] if result["init_load_info"] is not None else None
         }
     
     try:
-        evaluator.collect_test_case(
+        test_cases = evaluator.collect_test_case(
             program_info = program_info,
             program = result['program']
         )
+        if test_cases is None:
+            return None, False, None, None
 
         pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
         assert pass_list[0] == True
     except Exception as e:
-        logger.warning(f"Error in generating and collecting test case: {e}, skip.")
-        return None, False, None, None
+        logger.warning(f"Error in collecting test case: {e}, skip.")
+        return evaluator, False, None, None
     
     if result["condition_info"] is not None:
         init_local_info_new = copy.deepcopy(result["init_block"][1])
@@ -721,7 +759,9 @@ def generate_and_collect_test_case(
             "init_local_str": init_local_str_new,
             "init_local_info": init_local_info_new,
             "init_implicit_dict": result['init_implict_dict'],
-            "end_implict_list": implict_list
+            "end_implict_list": implict_list,
+            "init_load_str": result["init_load_info"][0] if result["init_load_info"] is not None else None,
+            "init_load_info": result["init_load_info"][1] if result["init_load_info"] is not None else None
         }
         try:
             evaluator.collect_test_case(

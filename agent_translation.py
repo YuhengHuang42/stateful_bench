@@ -46,6 +46,7 @@ def main(
     for idx in sorted(trace_evaluator_book.keys()):
         program_info.append({
             "init_block": trace_evaluator_book[idx].test_cases[0]["program_info"]["init_local_str"],
+            "init_load_info": trace_evaluator_book[idx].test_cases[0]["program_info"]["init_load_info"],
             "program": trace_evaluator_book[idx].test_cases[0]["program"]
         })
     

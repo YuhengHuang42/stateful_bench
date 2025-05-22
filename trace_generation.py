@@ -25,9 +25,11 @@ def main(
     if trace_save_path is None:
         trace_save_path = config_dict["env"]["trace_save_path"]
     
+    evaluation_config = {}
     if config_dict["task"] == "session":
         from Sgenerator.session_state import SessionEvaluator, SessionRandomInitializer, SessionVariableSchema
         base_url = config_dict["env"]["base_url"]
+        evaluation_config["base_url"] = base_url
         schema_class = SessionVariableSchema
         random_init_class = SessionRandomInitializer
         evaluator_class = SessionEvaluator
@@ -44,7 +46,7 @@ def main(
             random_init_class = random_init_class,
             evaluator_class = evaluator_class,
             trace_config = generation_config["trace_config"],
-            base_url = base_url,
+            evaluation_config = evaluation_config,
             num_of_apis = num_of_apis,
             control_position_candidate = control_position_candidate,
             occurence_book=occurence_book

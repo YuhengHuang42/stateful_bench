@@ -12,14 +12,16 @@ import requests
 import json
 import traceback
 import torch
+import numpy as np
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
 from Sgenerator.state import INDENT, RESULT_NAME, ProgramEvaluator, LocalVariable
 
-MAX_LINEAR_FEATURES = 128
+MAX_LINEAR_FEATURES = 32
 MAX_KERNEL_SIZE = 7
-MAX_CHANNELS = 128
+MAX_CHANNELS = 64
+FLOAT_THRESHOLD = 1e-2
 
 TENSOR_SUMMARY_PROMPT = '''
 '''
@@ -50,7 +52,7 @@ class TensorRandomInitializer(RandomInitializer):
         dim1 = random.randint(lower, upper)
         dim2 = random.randint(lower, upper)
         
-        dim3 = random.randint(lower, upper) * 2  # Generate even number between 2 and 64
+        dim3 = random.randint(lower // 2, upper // 2) * 2  # Generate even number between 2 and 64
         dim4 = dim3  # Third and fourth dimensions are equal
         
         # Create tensor with random values using torch.randn
@@ -137,12 +139,9 @@ class TensorVariableSchema(Schema):
                 created_by=USER_FUNCTION_PARAM_FLAG,
                 updated=True
             )
-            implicit_variable = TensorState(
-                name=tensor_name,
-                data=state
-            )
             self.add_local_variable(local_variable, update_implicit=True)
             #self.add_implicit_variable(implicit_variable, 0)
+            self.init_load_info[tensor_name] = state
             
         self.align_initial_state()
     
@@ -155,6 +154,8 @@ class TensorVariableSchema(Schema):
         self.local_call_map = {}
         self.init_load_info = {}
         self.init_local_info = []
+        self.init_tensor_counter = 0
+        self.init_weight_counter = 0
     
     def get_implicit_states(self, current_value: bool = True):
         result = {}
@@ -432,7 +433,6 @@ class TensorVariableSchema(Schema):
         else:
             name = f"user_tensor_{self.init_tensor_counter}"
             self.init_tensor_counter += 1
-        # TODO: Update this.
         # maintain the load info data structure.
         implicit_variable = TensorState(name, param_value)
         assert name not in self.implicit_states["tensor_info"]
@@ -487,15 +487,38 @@ class TensorVariableSchema(Schema):
         return False, []
     
     def postprocess_choose_result(self):
-        result_str = None
+        result_var_list = []
         for idx in range(len(self.local_states["variables"])-1, -1, -1):
             local_variable = self.local_states["variables"][idx]
-            transitions = local_variable.value.transitions
+            #transitions = local_variable.value.transitions
             if local_variable.updated == True:
                 # Either being updated or being queried.
-                result_str = f"{RESULT_NAME} = {local_variable.name}"
-                break
-        return result_str
+                #result_str = f"{RESULT_NAME} = {local_variable.name}"
+                result_var_list.append(local_variable)
+        if len(result_var_list) == 0:
+            return None
+        elif len(result_var_list) == 1:
+            return f"{RESULT_NAME} = {result_var_list[0].name}"
+        else:
+            result_str = f"{RESULT_NAME} = "
+            for idx, result_var in enumerate(result_var_list):
+                result_str += f"{result_var.name}.sum() + "
+            result_str = result_str[:-3]
+            return result_str
+    
+    def get_load_info(self, init_load_info=None):
+        # Return: program_string, list of (variable_name, variable_value)
+        if init_load_info is None:
+            init_load_info = self.init_load_info
+        if init_load_info is None or len(init_load_info) == 0:
+            return None, None
+        init_program = "# == The variables below will be pre-loaded into the memory. Here we only show the shape of the variables. ==\n"
+        all_init_pairs = []
+        for name, value in init_load_info.items():
+            init_program += f"{name} # shape: {value.shape}\n"
+            all_init_pairs.append((name, value))
+        init_program += "# == The variables above will be pre-loaded into the memory at evaluation runtime. ==\n"
+        return init_program, all_init_pairs
     
     def obtain_if_condition(self):
         """
@@ -610,8 +633,9 @@ class Conv2dTransition(Transition):
         return f"torch.nn.functional.conv2d({self.parameters['input'].name}, {self.parameters['weight'].name}, stride={self.parameters['stride']}, padding={self.parameters['padding']}, dilation={self.parameters['dilation']})"
 
     def get_program_str(self) -> Tuple[List[str], str]:
+        padding = self.parameters['padding'] if isinstance(self.parameters['padding'], int) else f"'{self.parameters['padding']}'"
         result = [
-            f"{self.new_variable_name} = torch.nn.functional.conv2d({self.parameters['input'].name}, {self.parameters['weight'].name}, stride={self.parameters['stride']}, padding={self.parameters['padding']}, dilation={self.parameters['dilation']}) # Output shape: {self.string_parameters['shape']}\n",
+            f"{self.new_variable_name} = torch.nn.functional.conv2d({self.parameters['input'].name}, {self.parameters['weight'].name}, stride={self.parameters['stride']}, padding={padding}, dilation={self.parameters['dilation']}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
 
@@ -659,6 +683,8 @@ class Conv2dTransition(Transition):
             # Generate parameters with constraints
             if valid_range['weight']['min_channels'] == valid_range['weight']['max_channels']:
                 out_channels = valid_range['weight']['min_channels']
+            elif valid_range['weight']['min_channels'] > valid_range['weight']['max_channels']:
+                return False, None
             else:
                 out_channels = random.randint(
                     valid_range['weight']['min_channels'],
@@ -749,7 +775,10 @@ class Conv2dTransition(Transition):
         
         # Generate stride (1 to input size)
         max_stride = min(inH, inW)
-        stride = random.randint(1, max_stride)
+        if max_stride == 1:
+            stride = 1
+        else:
+            stride = random.randint(1, max_stride)
         
         # Generate dilation (1 to max that fits in input)
         max_dilationH = (inH - 1) // (kH - 1) if kH > 1 else 1
@@ -949,7 +978,10 @@ class SplitTransition(Transition):
         returned_left = "("
         for idx, shape in enumerate(self.string_parameters["shape"]):
             returned_left += f"{self.new_variable_name}_{idx}, "
-        returned_left = returned_left[:-2] + ")"
+        if len(self.string_parameters["shape"]) == 1:
+            returned_left = returned_left + ")" # (a, ) = xxxxx
+        else:
+            returned_left = returned_left[:-2] + ")"
         returned_right = "shape: "
         for idx, shape in enumerate(self.string_parameters["shape"]):
             returned_right += f"{shape}, "
@@ -1208,6 +1240,13 @@ class LinearTransition(Transition):
     def generate_valid_parameters(input_shape: Tuple[int]):
         """Generate valid weight matrix for linear transformation"""
         valid_range = LinearTransition.calculate_valid_parameters(input_shape)
+        if valid_range['weight']['min_features'] > valid_range['weight']['max_features']:
+            if valid_range["weight"]["min_features"] == valid_range["weight"]["max_features"]:
+                out_features = valid_range["weight"]["min_features"]
+            elif valid_range["weight"]["max_features"] == 1:
+                out_features = 1
+            else:
+                return False, None
         out_features = random.randint(
             valid_range['weight']['min_features'],
             valid_range['weight']['max_features']
@@ -1330,8 +1369,196 @@ class TransposeTransition(Transition):
             f"{self.new_variable_name} = torch.transpose({self.parameters['input'].name}, {self.parameters['dim0']}, {self.parameters['dim1']}) # Output shape: {self.string_parameters['shape']}\n",
         ]
         return result, ""
-    
 
+class TensorEvaluator(ProgramEvaluator):
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.test_cases = []
+        
+    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
+        # 
+        pass
+
+
+    def store(self, file_path: str):
+        """Save test cases to disk. Handles torch tensors by converting them to lists."""
+        
+        def tensor_to_list(obj, level=0):
+            if level > 2:
+                return obj
+            if isinstance(obj, torch.Tensor):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: tensor_to_list(v) for k, v in obj.items()}
+            elif isinstance(obj, list) or isinstance(obj, tuple):
+                result = []
+                for item in obj:
+                    if isinstance(item, torch.Tensor):
+                        result.append(item.tolist())
+                    else:
+                        # Only one level of list is supported.
+                        result.append(tensor_to_list(item, level+1))
+                return result
+                #return [tensor_to_list(item) for item in obj]
+            return obj
+
+        # Convert test cases to serializable format
+        serializable_test_cases = []
+        for test_case in self.test_cases:
+            serializable_case = {
+                "result": tensor_to_list(test_case["result"]),
+                "state_oracle": test_case["state_oracle"],
+                "program_info": {
+                    "init_local_str": test_case["program_info"]["init_local_str"],
+                    "init_local_info": test_case["program_info"]["init_local_info"],
+                    "init_implicit_dict": None, # not necessary for this evaluator
+                    "end_implict_list": None, # not necessary for this evaluator
+                    "init_load_str": test_case["program_info"]["init_load_str"],
+                    "init_load_info": tensor_to_list(test_case["program_info"]["init_load_info"])
+                },
+                "program": test_case["program"]
+            }
+            serializable_test_cases.append(serializable_case)
+
+        # Save to file
+        saved_info = {  
+            "test_cases": serializable_test_cases,
+            "config": self.config
+        }
+        with open(file_path, 'w') as f:
+            json.dump(saved_info, f, indent=2)
+            
+    @classmethod
+    def load(cls, file_path: str, config: Dict[str, Any] = None):
+        """Load test cases from disk. Converts lists back to torch tensors."""
+        
+        # Load from file
+        with open(file_path, 'r') as f:
+            saved_info = json.load(f)
+        if config is None:
+            config = saved_info["config"]
+        created_cls = cls(config)
+        test_cases = saved_info["test_cases"]
+        
+        # Convert test cases back to tensor format
+        for test_case in test_cases:
+            if isinstance(test_case["result"], int) or isinstance(test_case["result"], float):
+                result = test_case["result"]
+            else:
+                result = torch.tensor(test_case["result"])
+            init_load_info = []
+            for (name, value) in test_case["program_info"]["init_load_info"]:
+                if isinstance(value, int) or isinstance(value, float):
+                    init_load_info.append((name, value))
+                else:
+                    init_load_info.append((name, torch.tensor(value)))
+            converted_case = {
+                "result": result,
+                "state_oracle": test_case["state_oracle"],
+                "program_info": {
+                    "init_local_str": test_case["program_info"]["init_local_str"],
+                    "init_local_info": test_case["program_info"]["init_local_info"],
+                    "init_implicit_dict": None, # not necessary for this evaluator
+                    "end_implict_list": None, # not necessary for this evaluator
+                    "init_load_str": test_case["program_info"]["init_load_str"],
+                    "init_load_info": init_load_info
+                },
+                "program": test_case["program"]
+            }
+            created_cls.test_cases.append(converted_case)
+
+        return created_cls
+    
+    def collect_test_case(self, program_info, program):
+        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_info'], program_info["init_load_info"])
+        namespace = {
+            "torch": torch,
+        }
+        init_load_info = program_info["init_load_info"]
+        complete_program = program_info["init_local_str"] + program
+        if init_load_info is not None:
+            for (name, value) in init_load_info:
+                namespace[name] = value.clone()
+        try:
+            exec(complete_program, namespace)
+        except Exception as e:
+            error_info = traceback.format_exc()
+            logger.warning(f"Error in executing the program: {error_info}")
+            return None
+        
+        if f"{RESULT_NAME}" in namespace:
+            result = namespace[RESULT_NAME]
+            if isinstance(result, torch.Tensor) and result.numel() == 1:
+                result = result.item()
+        else:
+            result = None
+        
+        test_case = {
+            "result": result,
+            "state_oracle": None,
+            "program_info": program_info,
+            "program": program
+        }
+        self.test_cases.append(test_case)
+        return test_case
+    
+    def evaluate(self, program: str):
+        pass_list = []
+        test_case_pass_detail = []
+        for test_case in self.test_cases:
+            namespace = {
+                "torch": torch
+            }
+            if test_case["program_info"]["init_load_info"] is not None:
+                for (name, value) in test_case["program_info"]["init_load_info"]:
+                    namespace[name] = value.clone()
+            complete_program = test_case["program_info"]["init_local_str"] + program
+            try:
+                exec(complete_program, namespace)
+            except Exception as e:
+                error_info = traceback.format_exc()
+                pass_list.append(False)
+                test_case_pass_detail.append({
+                    "result_pass": False,
+                    "error_info": error_info,
+                    "state_pass": None,
+                    "state_pass_detail": None,
+                })
+                continue
+            result_pass = True
+            if f"{RESULT_NAME}" in namespace:
+                result = namespace[RESULT_NAME]
+                if isinstance(result, torch.Tensor):
+                    if isinstance(test_case["result"], float) or isinstance(test_case["result"], int):
+                        if result.numel() != 1:
+                            result_pass = False
+                        result = result.item()
+                        if abs(result - test_case["result"]) > FLOAT_THRESHOLD:
+                            result_pass = False
+                    elif result.shape != test_case["result"].shape:
+                        result_pass = False
+                    elif not torch.allclose(result, test_case["result"], rtol=FLOAT_THRESHOLD, atol=FLOAT_THRESHOLD):
+                        result_pass = False
+                elif isinstance(result, (float, int)):
+                    if abs(result - test_case["result"]) > FLOAT_THRESHOLD:
+                        result_pass = False
+                else:
+                    if result != test_case["result"]:
+                        result_pass = False
+            else:
+                if test_case["result"] is not None:
+                    result_pass = False
+            pass_list.append(result_pass)
+            test_case_pass_detail.append({
+                "result_pass": result_pass,
+                "error_info": None,
+                "state_pass": None,
+                "state_pass_detail": None
+            })
+        return pass_list, test_case_pass_detail
+                
+    
+    
 def test_transpose():
     stateschema = TensorVariableSchema()
     new_tensor_value = torch.randn(3, 4)

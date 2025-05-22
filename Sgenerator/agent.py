@@ -384,6 +384,10 @@ class MultiAgent():
         assert turn in ["Generator", "Evaluator"]
         for idx, item in enumerate(program_info):
             init_block = item["init_block"]
+            init_load_str = item["init_load_str"]
+            if init_load_str is not None:
+                init_block = init_load_str + "\n" + init_block
+            
             program = item["program"]
             generator = agent_book[idx]["generator"]
             evaluator = agent_book[idx]["evaluator"]

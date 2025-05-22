@@ -494,6 +494,9 @@ class SessionVariableSchema(Schema):
                 return True
         return True
     
+    def get_load_info(self, init_load_info=None):
+        return None, None
+    
     def postprocess_transitions(self, remaining_call: int) -> Tuple[bool, List[str]]:
         """
         Postprocess the transitions.
@@ -1760,6 +1763,8 @@ class SessionEvaluator(ProgramEvaluator):
         ]
         self.local_environment_str = "\n".join(self.local_environment)
         self.occ_book_diff = None
+        super().__init__()
+        
     @classmethod
     def load(cls, file_path: str, config: Dict[str, Any] = None):
         with open(file_path, "r") as f:
@@ -1778,7 +1783,8 @@ class SessionEvaluator(ProgramEvaluator):
         with open(file_path, "w") as f:
             json.dump(saved_info, f)
             
-    def prepare_environment(self, init_implicit_dict, init_local_info):
+    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
+        # init_load_info not used for SessionEvaluator
         source_type_pair = [set([]), set([])]
         for idx in init_implicit_dict:
             source_type_pair[0].add(init_implicit_dict[idx]["source"])
@@ -1833,6 +1839,9 @@ class SessionEvaluator(ProgramEvaluator):
             "init_local_str": init_local_str
             "init_local_info": init_local_info
             --> Both items are returned by result["init_block"] of function generate_program
+            "init_load_str": init_load_str
+            "init_load_info": init_load_info
+            --> Both items are returned by result["init_load_info"] of function generate_program
             "init_implicit_dict": result["init_implicit_dict"]
             --> All the three items above are related to the initial state of the program.
             "end_implict_list": [session_id: state] --> Ending implicit states
@@ -1844,7 +1853,7 @@ class SessionEvaluator(ProgramEvaluator):
         complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
         complete_program = self.local_environment_str + "\n" + complete_program
         
-        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_info'])
+        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_info'], program_info["init_load_info"])
         exec(complete_program, namespace)
         
         # Collect States
