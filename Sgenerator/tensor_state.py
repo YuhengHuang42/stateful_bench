@@ -387,12 +387,14 @@ class TensorVariableSchema(Schema):
                     
                 elif transition.__name__ == "CatTransition":
                     whether_valid = False
+                    transition_pairs = []
                     for lvar in self.local_states["variables"]:
                         lvar_shape = lvar.value.shape
                         whether_valid, parameters = CatTransition.is_possible(input_shape, lvar_shape)
                         if whether_valid:
                             updated = updated or lvar.updated
                             parameters["tensors"] = [local_variable, lvar]
+                            transition_pairs.append(self.form_pair_transition(self.implicit_states["tensor_info"][lvar.name], transition.__name__))
                             break
                     if not whether_valid:
                         # Directly create a similar tensor.
@@ -405,7 +407,7 @@ class TensorVariableSchema(Schema):
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, parameters)):
                         continue
-                    transition_pairs = [self.form_pair_transition(tensor_variable, transition.__name__)]
+                    transition_pairs.append(self.form_pair_transition(tensor_variable, transition.__name__))
                     target_parameters = {
                         "required_parameters": parameters,
                         "latest_call": local_variable.latest_call,
@@ -575,7 +577,7 @@ class Conv2dTransition(Transition):
         assert isinstance(parameters["dilation"], int)
         
         
-        super().__init__("conv2d", parameters=parameters, func=None)
+        super().__init__("Conv2dTransition", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {
@@ -642,6 +644,8 @@ class Conv2dTransition(Transition):
     @staticmethod
     def calculate_valid_parameters(input_shape: Tuple[int]):
         if len(input_shape) != 4:
+            return None
+        if input_shape[0] == 0:
             return None
         _, in_channels, in_height, in_width = input_shape
         max_kernel = min(MAX_KERNEL_SIZE, in_height, in_width) # input is 224x224 --> 7*7
@@ -777,6 +781,8 @@ class Conv2dTransition(Transition):
         max_stride = min(inH, inW)
         if max_stride == 1:
             stride = 1
+        elif max_stride < 1:
+            return False, None
         else:
             stride = random.randint(1, max_stride)
         
@@ -814,7 +820,7 @@ class PermuteTransition(Transition):
         assert "input" in parameters
         assert isinstance(parameters["input"], LocalVariable)
         assert "dims" in parameters
-        super().__init__("permute", parameters=parameters, func=None)
+        super().__init__("PermuteTransition", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {
@@ -921,7 +927,7 @@ class SplitTransition(Transition):
         assert "split_size_or_sections" in parameters
         #assert isinstance(parameters["split_size_or_sections"], Union[int, List[int], Tuple[int]])
         assert "dim" in parameters
-        super().__init__("split", parameters=parameters, func=None)
+        super().__init__("SplitTransition", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {
@@ -1036,7 +1042,7 @@ class CatTransition(Transition):
                 if idx == parameters["dim"]:
                     continue
                 assert item_shape == tensor_shape[0][idx], f"The shape of the tensor {tensor.name} is not the same as the first tensor {parameters['tensors'][0].name} at dimension {idx}."
-        super().__init__("cat", parameters=parameters, func=None)
+        super().__init__("CatTransition", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {
@@ -1169,7 +1175,7 @@ class LinearTransition(Transition):
         assert isinstance(parameters["input"], LocalVariable)
         assert "weight" in parameters
         assert isinstance(parameters["weight"], LocalVariable)
-        super().__init__("linear", parameters=parameters, func=None)
+        super().__init__("LinearTransition", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {
@@ -1283,7 +1289,7 @@ class TransposeTransition(Transition):
         assert "dim0" in parameters
         assert isinstance(parameters["dim0"], int)
         assert "dim1" in parameters
-        super().__init__("transpose", parameters=parameters, func=None)
+        super().__init__("TransposeTransition", parameters=parameters, func=None)
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {

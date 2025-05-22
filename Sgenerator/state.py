@@ -389,10 +389,21 @@ class TraceGenerator:
                                                                                 copy.deepcopy(this_trace_duplicate_local_variable_map),
                                                                                 previous_transition_info)
                 selection_to_coverage_map = dict()
+                # Selection includes which transition with which index.
+                # energy_map: (transition_pair) -> energy
+                # Because energy_map is indexed by pairs,
+                # any transition results with multiple pairs (but same energy), will have higher chance to be selected.
+                # selection_to_coverage_map: (transition_pair) -> List of idx.
                 energy_map = dict()
-                # Compute coverage information
-                has_new_coverage = False
-                normalize_term = 0
+                # ====== Compute coverage information ======
+                new_coverage_list = []
+                #normalize_term = 0
+                #for pair in self.occurence_book:
+                #    normalize_term += self.occurence_book[pair]
+                if len(available_transitions) == 0:
+                    logger.warning(f"No available transitions for the {i+1}-th call. Terminate the trace generation.")
+                    return (trace, trace_str), this_trace_duplicate_local_variable_map, False
+                
                 for transition in available_transitions:
                     if transition not in this_trace_duplicate_local_variable_map:
                         this_trace_duplicate_local_variable_map[transition] = set()
@@ -403,44 +414,89 @@ class TraceGenerator:
                             continue
                         # Compute the coverage information
                         transition_pairs = transition_info["transition_pairs"]
-                        uncovered_pairs = [
-                                        pair for pair in transition_pairs
-                                        if pair not in self.occurence_book
-                        ]
-                        if len(uncovered_pairs) > 0:
-                            has_new_coverage = True
-                            normalize_term += len(uncovered_pairs)
-                        selection_to_coverage_map[(transition, idx)] = [len(uncovered_pairs), uncovered_pairs, transition_pairs]
-                if has_new_coverage and enable_coverage:
+                        #uncovered_pairs = [
+                        #                pair for pair in transition_pairs
+                        #                if pair not in self.occurence_book
+                        #]
+                        ## for pair in transition_pairs:
+                        ##    if pair not in selection_to_coverage_map:
+                        ##        selection_to_coverage_map[pair] = []
+                        ##    selection_to_coverage_map[pair].append([transition, idx])
+                        ##    if pair not in energy_map:
+                        ##        energy_map[pair] = self.occurence_book.get(pair, 0)
+                        ##        if energy_map[pair] == 0:
+                        ##            has_new_coverage = True
+                        #if len(uncovered_pairs) > 0:
+                        #    has_new_coverage = True
+                            #normalize_term += len(uncovered_pairs)
+                        #selection_to_coverage_map[(transition, idx)] = [len(uncovered_pairs), uncovered_pairs, transition_pairs]
+                        selection_to_coverage_map[(transition, idx)] = {}
+                        for pair in transition_pairs:
+                            occ = self.occurence_book.get(pair, 0)
+                            selection_to_coverage_map[(transition, idx)][pair] = occ
+                            if occ == 0:
+                                new_coverage_list.append((transition, idx))
+                if len(new_coverage_list) > 0 and enable_coverage:
                     # If there is new coverage, the next selection should be made from the transitions with new coverage.
-                    assert normalize_term > 0
+                    # The more transitions with new coverage, the higher chance to be selected.
+                    candidates = [(item, sum(1 for x in selection_to_coverage_map[item].values() if x == 0)) for item in new_coverage_list]
+                    selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0]
+                elif enable_coverage:
                     for transition, idx in selection_to_coverage_map:
-                        if selection_to_coverage_map[(transition, idx)][0] > 0:
-                            energy_map[(transition, idx)] = selection_to_coverage_map[(transition, idx)][0] / normalize_term
-                else:
+                        energy_map[(transition, idx)] = min(selection_to_coverage_map[(transition, idx)].values())
+                        energy_map[(transition, idx)] = 1 / (energy_map[(transition, idx)] + 1e-7)
                     # If there is no new coverage, the next selection should be made from the transitions with lower occurence.
-                    for transition, idx in selection_to_coverage_map:
-                        local_occurence = 0
-                        for pair in selection_to_coverage_map[(transition, idx)][2]:
-                            local_occurence += self.occurence_book.get(pair, 0)
-                        ave_occurence = local_occurence / len(selection_to_coverage_map[(transition, idx)][2])
-                        energy_map[(transition, idx)] = ave_occurence
-                        normalize_term += ave_occurence
-                    for transition, idx in selection_to_coverage_map:
-                        energy_map[(transition, idx)] = np.log(normalize_term / (energy_map[(transition, idx)] + 1e-7)) # IDF term in TF-IDF
+                    #for transition, idx in selection_to_coverage_map:
+                        #local_occurence = 0
+                        #local_occurence = self.occurence_book.get(selection_to_coverage_map[(transition, idx)][2][0], 0)
+                        #for pair in selection_to_coverage_map[(transition, idx)][2]:
+                            #local_occurence += self.occurence_book.get(pair, 0)
+                            #local_occurence = min(local_occurence, self.occurence_book.get(pair, 0))
+                        #energy_map[(transition, idx)] = local_occurence
+                        #ave_occurence = local_occurence / len(selection_to_coverage_map[(transition, idx)][2])
+                        #energy_map[(transition, idx)] = ave_occurence
+                        #normalize_term += ave_occurence
+                        #print(transition, ave_occurence)
+                    #if normalize_term == 0:
+                    #    normalize_term = 1
+                    #for transition, idx in selection_to_coverage_map:
+                        #energy_map[(transition, idx)] = np.log(normalize_term / (energy_map[(transition, idx)] + 1e-7)) # IDF term in TF-IDF
+                    #    energy_map[(transition, idx)] = 1 / (energy_map[(transition, idx)] + 1e-7)
+                    
+                    
                         
-                candidates = [(key, energy_map[key]) for key in energy_map]
-                if len(candidates) == 1:
-                    selected = candidates[0][0]
-                elif len(candidates) == 0:
-                    logger.warning(f"No available transitions for the {i+1}-th call. Terminate the trace generation.")
-                    return (trace, trace_str), this_trace_duplicate_local_variable_map, False
+                    candidates = [(key, energy_map[key]) for key in energy_map]
+                    selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0]
+                else:
+                    candidates = [(transition, idx) for transition in available_transitions.keys() for idx in range(len(available_transitions[transition]))]
+                    selected = random.choices(candidates, k=1)[0]
+                '''
+                sorted_candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+                for item in sorted_candidates:
+                    print(item)
+                    print(selection_to_coverage_map[item[0]])
+                    print_pairs = selection_to_coverage_map[item[0]][2]
+                    for pair in print_pairs:
+                        if pair in self.occurence_book:
+                            print("occurence: ", self.occurence_book[pair])
+                    print('-----')
+                '''
+                '''
                 else:
                     if enable_coverage:
-                        selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
+                        if has_new_coverage:
+                            selected = random.choices(candidates, k=1)[0][0] # All remaning should be new.
+                        else:
+                            selected = random.choices(candidates, weights=[c[1] for c in candidates], k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
+                        
                     else:
-                        selected = random.choices(candidates, k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
-                for pair in selection_to_coverage_map[selected][2]:
+                        candidates = [(transition, idx) for transition in available_transitions.keys() for idx in range(len(available_transitions[transition]))]
+                        selected_idx = random.choices(candidates, k=1)[0]
+                        #selected = random.choices(candidates, k=1)[0][0] # [0] for random.choices list return, [0] for the selected transition
+                    if enable_coverage:
+                        selected_idx = random.choices(selection_to_coverage_map[selected], k=1)[0]
+                '''
+                for pair in available_transitions[selected[0]][selected[1]]["transition_pairs"]:
                     self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
                 target_transition_info = available_transitions[selected[0]][selected[1]]
                 producer = target_transition_info["producer_variable_idx"]
@@ -691,7 +747,9 @@ def generate_and_collect_test_case(
     num_of_apis=5,
     control_position_candidate=[3, 4],
     occurence_book={},
-    evaluation_config={}
+    evaluation_config={},
+    enable_if_else=True,
+    enable_coverage=True
     ):
     state_schema = schema_class()
     random_init = random_init_class()
@@ -702,7 +760,7 @@ def generate_and_collect_test_case(
         occurence_book
     )
     trace_generator.prepare_initial_state()
-    result, is_success = generate_program(trace_generator, num_of_apis, control_position_candidate)
+    result, is_success = generate_program(trace_generator, num_of_apis, control_position_candidate, enable_if_else, enable_coverage)
     added_changes = utils.get_added_changes(occurence_book, result["occurence_book"])
     occurence_book = result["occurence_book"]
     if not is_success:
