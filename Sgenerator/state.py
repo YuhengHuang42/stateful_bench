@@ -252,7 +252,7 @@ class Schema:
     def add_local_constant(self, value, name=None):
         already_exist = False
         if name is None:
-            name = f"{USER_CONSTANT_FLAG}_{len(self.init_local_info)}"
+            name = self.get_new_local_constant_name()
         if isinstance(value, str):    
             value = f"\"{value}\""
         for item in self.init_local_info:
@@ -261,6 +261,10 @@ class Schema:
                 return (item[0], already_exist)
         self.init_local_info.append([name, value])
         return (name, already_exist)
+    
+    def get_new_local_constant_name(self):
+        name = f"{USER_CONSTANT_FLAG}_{len(self.init_local_info)}"
+        return name
     
     @staticmethod
     def return_init_local_info(init_local_info):
@@ -282,6 +286,8 @@ class LocalVariable:
     exist: bool = True
     created_by: str = None
     is_indexed: bool = False
+    variable_type: str = None
+    transitions: List[Transition] = field(default_factory=list) # We only use this in voice_state.py
     
 class RandomInitializer:
     """
@@ -513,7 +519,7 @@ class TraceGenerator:
                 new_transition.apply(implicit, local, self.state_schema)
                 trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
                 trace_str.append(new_transition.get_program_str())
-                previous_transition_info = (selected[0], target_transition_info["required_parameters"])
+                previous_transition_info = (selected[0], target_transition_info["required_parameters"]) # (Transition, parameters)
         
         return (trace, trace_str), this_trace_duplicate_local_variable_map, True
 

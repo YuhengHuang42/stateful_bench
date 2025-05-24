@@ -6,6 +6,22 @@ import random
 import os
 import copy
 
+GENDER_LIST = ["feminine", "masculine"]
+CATEGORY_LIST = ["conversational", 
+                 "professional", 
+                 "casual",
+                 "young",
+                 "old"
+                 ] 
+
+NAME_LIST = ["Emma", "James", "Sarah", "Michael", 
+             "Sofia", "Alexander", "Olivia", "William", 
+             "Isabella", "Daniel", "Ava", "Ethan", 
+             "Charlotte", "Lucas", "Mia", "Henry", "Sophia", 
+             "Benjamin", "Amelia", "Sebastian"
+             ]
+DEFAULT_DURATION = 16.0
+
 @dataclass
 class Speech:
     """Mock speech object containing audio data"""
@@ -14,7 +30,7 @@ class Speech:
     stability: float = 0
     similarity_boost: float = 0
     style: float = 0
-    duration: float = 16.0
+    duration: float = DEFAULT_DURATION
     transitions: List[Tuple[str, dict]] = field(default_factory=list)
 
     def __eq__(self, other: "Speech") -> bool:
@@ -67,25 +83,30 @@ class VoiceLibrary:
             "Emma": {"id": "v1", "category": "conversational", "gender": "feminine"},
             "James": {"id": "v2", "category": "professional", "gender": "masculine"},
             "Sarah": {"id": "v3", "category": "casual", "gender": "feminine"},
-            "Michael": {"id": "v4", "category": "professional", "gender": "masculine"},
+            "Michael": {"id": "v4", "category": "young", "gender": "masculine"},
             "Sofia": {"id": "v5", "category": "casual", "gender": "feminine"},
-            "Alexander": {"id": "v6", "category": "professional", "gender": "masculine"},
+            "Alexander": {"id": "v6", "category": "old", "gender": "masculine"},
             "Olivia": {"id": "v7", "category": "conversational", "gender": "feminine"},
             "William": {"id": "v8", "category": "professional", "gender": "masculine"},
-            "Isabella": {"id": "v9", "category": "casual", "gender": "feminine"},
-            "Daniel": {"id": "v10", "category": "professional", "gender": "masculine"},
-            "Ava": {"id": "v11", "category": "casual", "gender": "feminine"},
-            "Ethan": {"id": "v12", "category": "professional", "gender": "masculine"},
-            "Charlotte": {"id": "v13", "category": "conversational", "gender": "feminine"},
-            "Lucas": {"id": "v14", "category": "professional", "gender": "masculine"},
-            "Mia": {"id": "v15", "category": "casual", "gender": "feminine"},
-            "Henry": {"id": "v16", "category": "professional", "gender": "masculine"},
-            "Sophia": {"id": "v17", "category": "conversational", "gender": "feminine"},
-            "Benjamin": {"id": "v18", "category": "professional", "gender": "masculine"},
-            "Amelia": {"id": "v19", "category": "casual", "gender": "feminine"},
-            "Sebastian": {"id": "v20", "category": "professional", "gender": "masculine"}
+            "Isabella": {"id": "v9", "category": "old", "gender": "feminine"},
+            "Daniel": {"id": "v10", "category": "old", "gender": "masculine"},
+            "Ethan": {"id": "v11", "category": "professional", "gender": "masculine"},
+            "Charlotte": {"id": "v12", "category": "conversational", "gender": "feminine"},
+            "Lucas": {"id": "v13", "category": "professional", "gender": "masculine"},
+            "Mia": {"id": "v14", "category": "casual", "gender": "feminine"},
+            "Henry": {"id": "v15", "category": "young", "gender": "masculine"},
+            "Sophia": {"id": "v16", "category": "young", "gender": "feminine"},
         }
         self.current_id = max(int(voice_info["id"].replace("v", "")) for voice_info in self.voices.values()) + 1
+    
+    def obtain_all_categories(self) -> List[str]:
+        return list(set(voice_info["category"] for voice_info in self.voices.values()))
+    
+    def obtain_all_genders(self) -> List[str]:
+        return list(set(voice_info["gender"] for voice_info in self.voices.values()))
+    
+    def obtain_all_names(self) -> List[str]:
+        return list(self.voices.keys())
     
     def add_voice(self, voice_name: str, category: str, gender: str):
         self.voices[voice_name] = {"id": str(self.current_id), "category": category, "gender": gender}
@@ -110,14 +131,14 @@ class VoiceLibrary:
     def reset(self):
         self.__init__()
     
-    
+# These two global variables should be reset before program execution.
 voice_library = VoiceLibrary()
 call_recorder = OutboundCallRecorder()
 
 def search_voice_library(search_name: Optional[str] = None, 
                          search_category: Optional[str] = None, 
                          search_gender: Optional[str] = None
-                         ) -> List[str]:
+                         ) -> List[dict]:
     """Mock implementation of voice library search"""
     assert not((search_name is None) and (search_category is None) and (search_gender is None)), "At least one of search_name, search_category, or search_gender must be provided"
     global voice_library
@@ -130,9 +151,9 @@ def search_voice_library(search_name: Optional[str] = None,
 def text_to_speech(
     text: str,
     voice_name: Optional[str] = None,
-    stability: float = 0.5,
-    similarity_boost: float = 0.5,
-    style: float = 0.0
+    stability: float = None,
+    similarity_boost: float = None,
+    style: float = None
 ) -> Speech:
     """Mock implementation of text to speech conversion"""
     # Generate mock audio data
@@ -152,12 +173,12 @@ def speech_to_speech(input_speech: Speech, voice_name: str) -> Speech:
     new_item.transitions.append(["speech_to_speech", {"voice_name": voice_name}])
     return new_item
 
-def speech_to_text(input_speech: Speech, diarize: bool = False) -> str:
+def speech_to_text(input_speech: Speech, diarize: bool = False) -> dict:
     """Mock implementation of speech to text conversion"""
     # Generate mock transcription
     text = copy.deepcopy(input_speech.text)
     input_speech.transitions.append(["speech_to_text", {"diarize": diarize}])
-    return text
+    return {"text": text, "diarize": diarize}
 
 def isolate_audio(input_speech: Speech) -> Speech:
     """Mock implementation of audio isolation"""

@@ -885,6 +885,7 @@ class SessionVariableSchema(Schema):
                                 "local_variable_idx": idx,
                             })
                             #duplicate_local_variable_map[transition.__name__].add(duplicate_str)
+    
         return available_transitions
     
     def craft_transition(self, transition_info, calling_timestamp, transition, producer="None"):
