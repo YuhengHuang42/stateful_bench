@@ -76,26 +76,22 @@ class OutboundCallRecorder:
         self.__init__()
     
 
+# Warning: category + gender must be unique.
+# Otherwise the generation process in voice_state.py need to be updated (The for loop variable search part for SearchReturnValue)
 class VoiceLibrary:
     """Voice library containing predefined voices with enhanced metadata"""
     def __init__(self):
         self.voices = {
             "Emma": {"id": "v1", "category": "conversational", "gender": "feminine"},
             "James": {"id": "v2", "category": "professional", "gender": "masculine"},
-            "Sarah": {"id": "v3", "category": "casual", "gender": "feminine"},
+            "Oliver": {"id": "v3", "category": "casual", "gender": "masculine"},
             "Michael": {"id": "v4", "category": "young", "gender": "masculine"},
             "Sofia": {"id": "v5", "category": "casual", "gender": "feminine"},
             "Alexander": {"id": "v6", "category": "old", "gender": "masculine"},
-            "Olivia": {"id": "v7", "category": "conversational", "gender": "feminine"},
-            "William": {"id": "v8", "category": "professional", "gender": "masculine"},
-            "Isabella": {"id": "v9", "category": "old", "gender": "feminine"},
-            "Daniel": {"id": "v10", "category": "old", "gender": "masculine"},
-            "Ethan": {"id": "v11", "category": "professional", "gender": "masculine"},
-            "Charlotte": {"id": "v12", "category": "conversational", "gender": "feminine"},
-            "Lucas": {"id": "v13", "category": "professional", "gender": "masculine"},
-            "Mia": {"id": "v14", "category": "casual", "gender": "feminine"},
-            "Henry": {"id": "v15", "category": "young", "gender": "masculine"},
-            "Sophia": {"id": "v16", "category": "young", "gender": "feminine"},
+            "Evelyn": {"id": "v7", "category": "professional", "gender": "feminine"},
+            "Isabella": {"id": "v8", "category": "old", "gender": "feminine"},
+            "Arthur": {"id": "v9", "category": "conversational", "gender": "masculine"},
+            "Sophia": {"id": "v10", "category": "young", "gender": "feminine"},
         }
         self.current_id = max(int(voice_info["id"].replace("v", "")) for voice_info in self.voices.values()) + 1
     
@@ -126,6 +122,7 @@ class VoiceLibrary:
                 item = {key: voice_info[key] for key in ["category", "gender"]}
                 item["voice_name"] = voice_name
                 result.append(item)
+        result = sorted(result, key=lambda x: x["voice_name"])
         return result
     
     def reset(self):
@@ -145,7 +142,8 @@ def search_voice_library(search_name: Optional[str] = None,
     if search_name is not None:
         return voice_library.get_voice_by_name(search_name)
     else:
-        return voice_library.get_voice_by_info(category=search_category, gender=search_gender)
+        result = voice_library.get_voice_by_info(category=search_category, gender=search_gender)
+        return result
     
 
 def text_to_speech(

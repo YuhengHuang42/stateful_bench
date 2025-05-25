@@ -166,7 +166,11 @@ class Schema:
         if len(state.transitions) == 0:
             last_transition = "NONE"
         else:
-            last_transition = state.transitions[-1]["name"]
+            try:
+                last_transition = state.transitions[-1]["name"]
+            except:
+                print(state.transitions)
+                raise ValueError("Invalid transition list")
         transition_pair = (last_transition, new_transition, )
         return transition_pair
 
@@ -410,6 +414,7 @@ class TraceGenerator:
                     logger.warning(f"No available transitions for the {i+1}-th call. Terminate the trace generation.")
                     return (trace, trace_str), this_trace_duplicate_local_variable_map, False
                 
+                has_transition = False
                 for transition in available_transitions:
                     if transition not in this_trace_duplicate_local_variable_map:
                         this_trace_duplicate_local_variable_map[transition] = set()
@@ -420,6 +425,7 @@ class TraceGenerator:
                             continue
                         # Compute the coverage information
                         transition_pairs = transition_info["transition_pairs"]
+                        has_transition = True
                         #uncovered_pairs = [
                         #                pair for pair in transition_pairs
                         #                if pair not in self.occurence_book
@@ -442,6 +448,9 @@ class TraceGenerator:
                             selection_to_coverage_map[(transition, idx)][pair] = occ
                             if occ == 0:
                                 new_coverage_list.append((transition, idx))
+                if not has_transition:
+                    logger.warning(f"No available transitions for the {i+1}-th call. Terminate the trace generation.")
+                    return (trace, trace_str), this_trace_duplicate_local_variable_map, False
                 if len(new_coverage_list) > 0 and enable_coverage:
                     # If there is new coverage, the next selection should be made from the transitions with new coverage.
                     # The more transitions with new coverage, the higher chance to be selected.

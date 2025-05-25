@@ -12,13 +12,13 @@ from Sgenerator import voice_lab
 from Sgenerator.voice_lab import Speech
 
 INIT_VOICE = "user_voice"
+LOOP_VARIABLE = "voice_item"
 
 class VoiceLocalVariableType(Enum):
     STATE = "state"
-    VOICE_TYPE = "voice_type" # Dict Combination of voice_name, voice_category, voice_gender
     VOICE_NAME = "voice_name"
-    VOICE_CATEGORY = "voice_category"
-    VOICE_GENDER = "voice_gender"
+    VOICE_SEARCH_CONTENT = "voice_search_content" # used for search_voice_library
+    VOICE_RETURN_CONTENT = "voice_return_content" # used for search_voice_library
     VOICE_TEXT = "voice_text"
     VOICE_TRANSCRIPTION = "voice_transcription" # Dict Combination of text, diarize
 
@@ -37,7 +37,7 @@ class VoiceRandomInitializer(RandomInitializer):
                 stability=None,
                 similarity_boost=None,
                 style=None,
-                duration=None
+                duration=voice_lab.DEFAULT_DURATION
             ),
             outbound=False,
             created_by=USER_FUNCTION_PARAM_FLAG
@@ -67,38 +67,33 @@ class VoiceRandomInitializer(RandomInitializer):
         if choice < 1/4:
             name = random.choice(voice_lab.voice_library.obtain_all_names())
             lvar.variable_type = VoiceLocalVariableType.VOICE_NAME
-            lvar.value = {"voice_name": name}
+            lvar.value = name
         elif choice < 2/4:
             name = None
             category = random.choice(voice_lab.voice_library.obtain_all_categories())
             gender = None
-            lvar.variable_type = VoiceLocalVariableType.VOICE_CATEGORY
-            lvar.value = {"voice_category": category}
+            lvar.variable_type = VoiceLocalVariableType.VOICE_SEARCH_CONTENT
+            lvar.value = {"search_category": category}
         elif choice < 3/4:
             name = None
             category = None
             gender = random.choice(voice_lab.voice_library.obtain_all_genders())
-            lvar.variable_type = VoiceLocalVariableType.VOICE_GENDER
-            lvar.value = {"voice_gender": gender}
+            lvar.variable_type = VoiceLocalVariableType.VOICE_SEARCH_CONTENT
+            lvar.value = {"search_gender": gender}
         else:
             item = random.choice([(key, value) for (key, value) in voice_lab.voice_library.voices.items()])
-            lvar.variable_type = VoiceLocalVariableType.VOICE_TYPE
-            lvar.value = {"voice_name": item[0], "voice_category": item[1]["category"], "voice_gender": item[1]["gender"]}
+            lvar.variable_type = VoiceLocalVariableType.VOICE_SEARCH_CONTENT
+            lvar.value = {"search_category": item[1]["category"], "search_gender": item[1]["gender"]}
         return lvar
-    
-    def random_generate_voice_state(self):
-        lvar = LocalVariable(
-            name=USER_FUNCTION_PARAM_FLAG,
-            value=self.random_generate_state(),
-        )
 
 class VoiceState(State):
     def __init__(self, 
                  name: str,
                  voice_value: Speech,
-                 outbound: bool = False
+                 outbound: bool = False,
+                 created_by: str = None
                  ):
-        super().__init__(name)
+        super().__init__(name, created_by=created_by)
         self.initial_value = OrderedDict([
             ("voice_value", voice_value),
             ("outbound", outbound)
@@ -140,14 +135,85 @@ class VoiceVariableSchema(Schema):
         self.init_implict_dict[implicit_variable.identifier] = implicit_variable
 
     def add_local_variable(self, local_variable: Any, update_implicit=False):
+        if local_variable.variable_type == VoiceLocalVariableType.VOICE_NAME:
+            assert not isinstance(local_variable.value, VoiceState), "VoiceName should not be a VoiceState"
         self.local_states["variables"].append(local_variable)
 
-    def prepare_initial_state(self, random_generator: VoiceRandomInitializer, config: Dict[str, Any], random_generate_config: Dict[str, Any]):
+    def prepare_initial_state(self, 
+                              random_generator: VoiceRandomInitializer, 
+                              config: Dict[str, Any], 
+                              random_generate_config: Dict[str, Any]):
         self.clear_state()
+        which_as_input = random.choice([0, 1, 2]) # 0: text, 1: voice, 2: text and voice
+        text_range = random.randint(config["init_text_range"][0], config["init_text_range"][1])
+        voice_range = random.randint(config["init_voice_range"][0], config["init_voice_range"][1])
+        if "max_init_state_num" in config:
+            max_init_state_num = config["max_init_state_num"]
+            self.max_init_state_num = max_init_state_num
+        else:
+            self.max_init_state_num = None
+            max_init_state_num = None
+        if which_as_input == 0:
+            for i in range(text_range):
+                text = random_generator.random_generate_text()
+                text.name = f"{text.name}_{len(self.init_local_info)}"
+                self.init_local_info.append([text.name, text])
+                self.add_local_variable(text)
+            voice = None
+        elif which_as_input == 1:
+            text = None
+            for i in range(voice_range):
+                voice = random_generator.random_generate_state()
+                voice.identifier = f"{voice.identifier}_{len(self.init_local_info)}"
+                self.init_local_info.append([voice.identifier, voice])
+                new_local_variable = LocalVariable(name=voice.identifier,
+                                                value=voice,
+                                                latest_call=0,
+                                                updated=True,
+                                                created_by=USER_FUNCTION_PARAM_FLAG,
+                                                variable_type=VoiceLocalVariableType.STATE
+                                                )
+                self.add_local_variable(new_local_variable)
+                self.add_implicit_variable(voice, 0)
+        elif which_as_input == 2:
+            if max_init_state_num is not None and text_range + voice_range > max_init_state_num:
+                # Reduce both ranges proportionally to fit within max_state_num
+                total = text_range + voice_range
+                text_range = int((text_range / total) * max_init_state_num)
+                text_range = max(text_range, 1)
+                voice_range = max_init_state_num - text_range
+                voice_range = max(voice_range, 1)
+            for i in range(text_range):
+                text = random_generator.random_generate_text()
+                text.name = f"{text.name}_{len(self.init_local_info)}"
+                self.init_local_info.append([text.name, text])
+                self.add_local_variable(text)
+            for i in range(voice_range):
+                voice = random_generator.random_generate_state()
+                voice.identifier = f"{voice.identifier}_{len(self.init_local_info)}"
+                new_local_variable = LocalVariable(name=voice.identifier,
+                                                value=voice,
+                                                latest_call=0,
+                                                updated=True,
+                                                created_by=USER_FUNCTION_PARAM_FLAG,
+                                                variable_type=VoiceLocalVariableType.STATE
+                                                )
+                self.init_local_info.append([voice.identifier, new_local_variable])
+                self.add_local_variable(new_local_variable)
+                self.add_implicit_variable(voice, 0)
+        voice_name = random_generator.random_generate_voice_term()
+        voice_name.name = f"{voice_name.name}_{len(self.init_local_info)}"
+        if isinstance(voice_name.value, Dict) and len(voice_name.value) == 1:
+            single_value = list(voice_name.value.values())[0]
+            self.init_local_info.append([voice_name.name, single_value])
+        else:
+            self.init_local_info.append([voice_name.name, voice_name])
+        self.add_local_variable(voice_name)
+        self.align_initial_state()
 
     def clear_state(self):
         self.local_states["variables"] = []
-        self.implicit_states["tensor_info"] = {}
+        self.implicit_states["voice_info"] = {}
         self.implicit_states["latest_call"] = {}
         self.init_implict_dict = {}
         self.implicit_call_map = {}
@@ -159,8 +225,43 @@ class VoiceVariableSchema(Schema):
         voice_lab.voice_library.reset()
         voice_lab.call_recorder.reset()
     
+    def postprocess_choose_result(self):
+        result_var_list = []
+        for idx in range(len(self.local_states["variables"])-1, -1, -1):
+            local_variable = self.local_states["variables"][idx]
+            #transitions = local_variable.value.transitions
+            if local_variable.updated == True:
+                # Either being updated or being queried.
+                #result_str = f"{RESULT_NAME} = {local_variable.name}"
+                result_var_list.append(local_variable)
+        if len(result_var_list) == 0:
+            return None
+        elif len(result_var_list) == 1:
+            return f"{RESULT_NAME} = {result_var_list[0].name}"
+        else:
+            result_str = f"{RESULT_NAME} = "
+            for idx, result_var in enumerate(result_var_list):
+                result_str += f"{result_var.name}, "
+            result_str = result_str[:-2]
+            return result_str
+    
+    def postprocess_transitions(self, remaining_call: int) -> Tuple[bool, List[str]]:
+        '''
+        No need to postprocess. We do not have remote database to be updated.
+        '''
+        return False, []
+    
     def get_implicit_states(self, current_value: bool = True):
-        pass
+        result = {}
+        if current_value is True:
+            voice_info = self.implicit_states["voice_info"]
+            for key, value in voice_info.items():
+                result[key] = value.current_value
+        else:
+            voice_info = self.init_implict_dict
+            for key, value in voice_info.items():
+                result[key] = value
+        return result
     
     def align_initial_state(self):
         pass
@@ -177,10 +278,31 @@ class VoiceVariableSchema(Schema):
     def determine_whether_to_keep_pair(self, previous_transition_info: Tuple, current_transition_info: Tuple):
         #  transition_info = (Transition, parameters)
         # 1. isolate_audio can only be selected if it is not selected before, or there is a speech_to_speech in between.
-        # 2. make_outbound_call with the same parameters should not be selected.
-        # 3. text_to_speech with the same parameters should not be selected.
+        # 2. make_outbound_call with the same parameters should not be selected. --> Be managed by duplicate_local_variable_map
+        # 3. text_to_speech with the same parameters should not be selected. --> Be managed by duplicate_local_variable_map
         # 4. 
-        pass
+        if current_transition_info[0] == "IsolateAudioTransition":
+            state = current_transition_info[1]["input_speech"]
+            if isinstance(state, LocalVariable):
+                name = state.name
+            elif isinstance(state, VoiceState):
+                name = state.identifier
+            else:
+                raise ValueError(f"Invalid state type: {type(state)}")
+            transition_list = self.implicit_states["voice_info"][name].transitions
+            for idx in range(len(transition_list)-1, -1, -1):
+                if transition_list[idx]["name"] == "IsolateAudioTransition":
+                    # Check if there's a speech_to_speech transition between this and current
+                    found_speech_to_speech = False
+                    for t in transition_list[idx:]:
+                        if t["name"] == "SpeechToSpeechTransition":
+                            found_speech_to_speech = True
+                            break
+                    if not found_speech_to_speech:
+                        return False
+        
+        return True
+    
     
     def transform_parameters_to_str(self, parameters: Dict[str, Any]):
         result = ""
@@ -253,29 +375,26 @@ class VoiceVariableSchema(Schema):
             # 
             for idx, lvar in enumerate(self.local_states["variables"]):
                 if transition.__name__ == "SearchVoiceTransition":
-                    # ["search_name", "search_category", "search_gender"]
-                    if lvar.variable_type == VoiceLocalVariableType.VOICE_NAME:
-                        required_parameters = {
-                            "search_name": lvar,
-                            "search_category": None,
-                            "search_gender": None,
-                        }
-                    elif lvar.variable_type == VoiceLocalVariableType.VOICE_CATEGORY:
-                        required_parameters = {
-                            "search_category": lvar,
-                            "search_name": None,
-                            "search_gender": None,
-                        }
-                    elif lvar.variable_type == VoiceLocalVariableType.VOICE_GENDER:
-                        required_parameters = {
-                            "search_gender": lvar,
-                            "search_name": None,
-                            "search_category": None,
-                        }
-                    elif lvar.variable_type == VoiceLocalVariableType.VOICE_TYPE:
-                        required_parameters = {
-                            "search_name": lvar, # We deal this situation inside SearchVoiceTransition
-                        }
+                    # ["search_category", "search_gender"]
+                    if lvar.variable_type == VoiceLocalVariableType.VOICE_SEARCH_CONTENT:
+                        if "search_category" in lvar.value:
+                            if "search_gender" in lvar.value:
+                                required_parameters = {
+                                    "search_category": lvar,
+                                    "search_gender": lvar,
+                                }
+                            else:
+                                required_parameters = {
+                                    "search_category": lvar,
+                                    "search_gender": None,
+                                }
+                        elif "search_gender" in lvar.value:
+                            required_parameters = {
+                                "search_category": None,
+                                "search_gender": lvar,
+                            }
+                        else:
+                            continue
                     else:
                         continue
                     if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, required_parameters)):
@@ -295,13 +414,20 @@ class VoiceVariableSchema(Schema):
                 elif transition.__name__ == "TextToSpeechTransition":
                     if lvar.variable_type == VoiceLocalVariableType.VOICE_TEXT:
                         # As long as we can get text, we will be able to call text_to_speech
-                        for idx in range(len(self.local_states["variables"]), -1, -1):
+                        candidate_voice_name = []
+                        for idx in range(len(self.local_states["variables"])-1, -1, -1):
                             variable_type = self.local_states["variables"][idx].variable_type
-                            if variable_type == VoiceLocalVariableType.VOICE_NAME or variable_type == VoiceLocalVariableType.VOICE_TYPE:
+                            if variable_type == VoiceLocalVariableType.VOICE_NAME or variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                                 voice_name = self.local_states["variables"][idx]
-                                break
-                        else:
+                                candidate_voice_name.append((voice_name, voice_name.updated))
+                        if len(candidate_voice_name) == 0:
                             voice_name = None
+                        else:
+                            updated_candidate_voice_name = [voice_name for voice_name, updated in candidate_voice_name if updated]
+                            if len(updated_candidate_voice_name) > 0:
+                                voice_name = random.choice(updated_candidate_voice_name)
+                            else:
+                                voice_name = random.choice(candidate_voice_name)[0]
                         required_parameters = {
                             "text": lvar,
                             "voice_name": voice_name,
@@ -314,8 +440,8 @@ class VoiceVariableSchema(Schema):
                         if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, required_parameters)):
                             continue
                         skip_flag = False
-                        for transition in lvar.transitions:
-                            if transition[0] == transition.__name__:
+                        for transition_info in lvar.transitions:
+                            if transition_info["name"] == transition.__name__:
                                 # The text has already been modified. 
                                 # In order to make the generated program more realistic, 
                                 # we try in-place modification
@@ -344,16 +470,20 @@ class VoiceVariableSchema(Schema):
                 elif transition.__name__ == "SpeechToSpeechTransition":
                     # input_speech, voice_name
                     if lvar.variable_type == VoiceLocalVariableType.STATE:
-                        find_voice = False
-                        for idx in range(len(self.local_states["variables"]), -1, -1):
+                        candidate_voice_name = []
+                        for idx in range(len(self.local_states["variables"])-1, -1, -1):
                             variable_type = self.local_states["variables"][idx].variable_type
-                            if variable_type == VoiceLocalVariableType.VOICE_NAME or variable_type == VoiceLocalVariableType.VOICE_TYPE:
+                            if variable_type == VoiceLocalVariableType.VOICE_NAME or variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                                 voice_name = self.local_states["variables"][idx]
-                                find_voice = True
-                                break
-                        if not find_voice:
-                            # Generate a new voice_name here
+                                candidate_voice_name.append((voice_name, voice_name.updated))
+                        if len(candidate_voice_name) == 0:
                             voice_name = random.choice(voice_lab.voice_library.obtain_all_names())
+                        else:
+                            updated_candidate_voice_name = [voice_name for voice_name, updated in candidate_voice_name if updated]
+                            if len(updated_candidate_voice_name) > 0:
+                                voice_name = random.choice(updated_candidate_voice_name)
+                            else:
+                                voice_name = random.choice(candidate_voice_name)[0]
                         required_parameters = {
                             "input_speech": lvar,
                             "voice_name": voice_name,
@@ -415,16 +545,24 @@ class VoiceVariableSchema(Schema):
                         available_transitions[transition.__name__].append(target_parameters)
                 elif transition.__name__ == "MakeOutboundCallTransition":
                     # input_speech, voice_name
+                    candidate_voice_name = []
                     if lvar.variable_type == VoiceLocalVariableType.STATE:
-                        for idx in range(len(self.local_states["variables"]), -1, -1):
+                        for idx in range(len(self.local_states["variables"])-1, -1, -1):
                             variable_type = self.local_states["variables"][idx].variable_type
-                            if variable_type == VoiceLocalVariableType.VOICE_NAME or variable_type == VoiceLocalVariableType.VOICE_TYPE:
+                            if variable_type == VoiceLocalVariableType.VOICE_NAME or variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                                 voice_name = self.local_states["variables"][idx]
-                                break
+                                candidate_voice_name.append((voice_name, voice_name.updated))
+                        if len(candidate_voice_name) == 0:
+                            voice_name = random.choice(voice_lab.voice_library.obtain_all_names())
                         else:
-                            voice_name = None
+                            updated_candidate_voice_name = [voice_name for voice_name, updated in candidate_voice_name if updated]
+                            if len(updated_candidate_voice_name) > 0:
+                                voice_name = random.choice(updated_candidate_voice_name)
+                            else:
+                                voice_name = random.choice(candidate_voice_name)[0]
                         required_parameters = {
                             "input_speech": lvar,
+                            "voice_name": voice_name,
                         }
                         if not self.determine_whether_to_keep_pair(previous_transition_info, (transition.__name__, required_parameters)):
                             continue
@@ -454,19 +592,38 @@ class VoiceVariableSchema(Schema):
     
     def craft_transition(self, transition_info, calling_timestamp, transition, producer="None"):
         if transition == "TextToSpeechTransition":
-            if transition_info["required_parameters"]["text_modification"] == "split":
-                local_state = transition_info["required_parameters"]["text"]
-                local_state.value = local_state.value.split(".")[0] + "."
+            if "text_modification" in transition_info["required_parameters"]:
+                if transition_info["required_parameters"]["text_modification"] == "split":
+                    local_state = transition_info["required_parameters"]["text"]
+                    local_state.value = local_state.value.split(".")[0] + "."
         elif transition == "SpeechToSpeechTransition":
             if isinstance(transition_info["required_parameters"]["voice_name"], str):
                 new_name = self.get_new_local_constant_name()
+                pass_parameters = SpeechToSpeechTransition.process_parameters(transition_info["required_parameters"])
                 new_local_variable = LocalVariable(name=new_name,
-                                                   value=transition_info["required_parameters"]["voice_name"],
+                                                   value={"voice_name": transition_info["required_parameters"]["voice_name"]},
                                                    variable_type=VoiceLocalVariableType.VOICE_NAME,
                                                    latest_call=calling_timestamp,
                                                    updated=False, # This variable will soon be used
                                                    created_by=USER_FUNCTION_PARAM_FLAG,
-                                                   transitions=[transition, transition_info["required_parameters"]]
+                                                   transitions=[{"name": transition, 
+                                                                 "parameters": pass_parameters}]
+                                                   )
+                self.add_local_constant(new_local_variable)
+                self.add_local_variable(new_local_variable)
+                transition_info["required_parameters"]["voice_name"] = new_local_variable
+        elif transition == "MakeOutboundCallTransition":
+            if isinstance(transition_info["required_parameters"]["voice_name"], str):
+                new_name = self.get_new_local_constant_name()
+                pass_parameters = MakeOutboundCallTransition.process_parameters(transition_info["required_parameters"])
+                new_local_variable = LocalVariable(name=new_name,
+                                                   value={"voice_name": transition_info["required_parameters"]["voice_name"]},
+                                                   variable_type=VoiceLocalVariableType.VOICE_NAME,
+                                                   latest_call=calling_timestamp,
+                                                   updated=False,
+                                                   created_by=USER_FUNCTION_PARAM_FLAG,
+                                                   transitions=[{"name": transition, 
+                                                                 "parameters": pass_parameters}]
                                                    )
                 self.add_local_constant(new_local_variable)
                 self.add_local_variable(new_local_variable)
@@ -482,8 +639,8 @@ class VoiceVariableSchema(Schema):
         
     
     # Functions in voice_lab.py
-    def search_voice_library(self, search_name: str, search_category: str, search_gender: str):
-        return voice_lab.search_voice_library(search_name, search_category, search_gender)
+    def search_voice_library(self, search_category: str, search_gender: str, search_name: str=None):
+        return voice_lab.search_voice_library(search_category=search_category, search_gender=search_gender, search_name=search_name)
     
     # Functions in voice_lab.py
     def text_to_speech(self, text: str, voice_name: str=None, stability: float=None, similarity_boost: float=None, style: float=None):
@@ -514,7 +671,7 @@ class SearchVoiceTransition(Transition):
         self.string_parameters = {}
         
     def get_required_parameters(self) -> List[str]:
-        return ["search_name", "search_category", "search_gender"]
+        return ["search_category", "search_gender"]
     
     def get_effected_states(self, variable_schema: VoiceVariableSchema) -> List[str]:
         """
@@ -522,37 +679,39 @@ class SearchVoiceTransition(Transition):
         """
         implicit_states = []
         local_states = []
-        search_name = self.parameters["search_name"]
-        search_category = self.parameters["search_category"]
-        search_gender = self.parameters["search_gender"]
+        search_category = self.parameters["search_category"] if "search_category" in self.parameters else None
+        search_gender = self.parameters["search_gender"] if "search_gender" in self.parameters else None
         variable_list = []
-        if search_name is not None and isinstance(search_name, LocalVariable):
-            if search_name.variable_type == VoiceLocalVariableType.VOICE_TYPE:
-                self.string_parameters["search_name"] = search_name.name + "['voice_name']"
-                self.string_parameters["search_category"] = search_name.name + "['voice_category']"
-                self.string_parameters["search_gender"] = search_name.name + "['voice_gender']"
-            else:
-                self.string_parameters["search_name"] = search_name.name
-            variable_list.append(search_name.name)
-        elif isinstance(search_name, str):
-            self.string_parameters["search_name"] = f'"{search_name}"'
-        elif search_name is not None:
-            raise Exception(f"search_name must be a LocalVariable or a string, but got {type(search_name)}")
         
-        if search_category is not None and isinstance(search_category, LocalVariable):
-            self.string_parameters["search_category"] = search_category.name
-            variable_list.append(search_category.name)
-        elif isinstance(search_category, str):
-            self.string_parameters["search_category"] = f'"{search_category}"'
+        if search_category is not None and search_gender is not None:
+            # 1. The input are both str.
+            # 2. The input is dict local variable.
+            if isinstance(search_category, str) and isinstance(search_gender, str):
+                self.string_parameters["search_category"] = f'"{search_category}"'
+                self.string_parameters["search_gender"] = f'"{search_gender}"'
+            elif isinstance(search_category, LocalVariable) and isinstance(search_gender, LocalVariable):
+                self.string_parameters["search_category"] = f"{search_category.name}['voice_category']"
+                self.string_parameters["search_gender"] = f"{search_gender.name}['voice_gender']"
+                variable_list.append(search_category.name)
+                variable_list.append(search_gender.name)
+            else:
+                raise Exception(f"search_category and search_gender must be a LocalVariable or a string, but got {type(search_category)} and {type(search_gender)}")
         elif search_category is not None:
-            raise Exception(f"search_category must be a LocalVariable or a string, but got {type(search_category)}")
-        if search_gender is not None and isinstance(search_gender, LocalVariable):
-            self.string_parameters["search_gender"] = search_gender.name
-            variable_list.append(search_gender.name)
-        elif isinstance(search_gender, str):
-            self.string_parameters["search_gender"] = f'"{search_gender}"'
+            if isinstance(search_category, str):
+                self.string_parameters["search_category"] = f'"{search_category}"'
+            elif isinstance(search_category, LocalVariable):
+                self.string_parameters["search_category"] = search_category.name
+                variable_list.append(search_category.name)
+            else:
+                raise Exception(f"search_category must be a LocalVariable or a string, but got {type(search_category)}")
         elif search_gender is not None:
-            raise Exception(f"search_gender must be a LocalVariable or a string, but got {type(search_gender)}")
+            if isinstance(search_gender, str):
+                self.string_parameters["search_gender"] = f'"{search_gender}"'
+            elif isinstance(search_gender, LocalVariable):
+                self.string_parameters["search_gender"] = search_gender.name
+                variable_list.append(search_gender.name)
+            else:
+                raise Exception(f"search_gender must be a LocalVariable or a string, but got {type(search_gender)}")
         
         for name in variable_list:
             for local_idx in range(len(variable_schema.local_states["variables"])-1, -1, -1):
@@ -570,16 +729,18 @@ class SearchVoiceTransition(Transition):
             if len(variable_schema.local_states["variables"][l_state].transitions) > len(longest_transitions):
                 longest_transitions = copy.deepcopy(variable_schema.local_states["variables"][l_state].transitions)
         pass_parameters = {}
-        if self.parameters["search_name"] is not None:
-            if isinstance(self.parameters["search_name"], LocalVariable):
-                if self.parameters["search_name"].variable_type == VoiceLocalVariableType.VOICE_TYPE:
-                    pass_parameters["search_name"] = self.parameters["search_name"].value["voice_name"]
-                    pass_parameters["search_category"] = self.parameters["search_name"].value["voice_category"]
-                    pass_parameters["search_gender"] = self.parameters["search_name"].value["voice_gender"]
-        if len(pass_parameters) == 0:
+        if len(self.string_parameters) == 2:
+            pass_parameters["search_category"] = self.parameters["search_category"].value["search_category"]
+            pass_parameters["search_gender"] = self.parameters["search_gender"].value["search_gender"]
+        else:
             for key, value in self.parameters.items():
                 if isinstance(value, LocalVariable):
-                    pass_parameters[key] = value.value
+                    if isinstance(value.value, dict):
+                        dict_value = list(value.value.values())
+                        assert len(dict_value) == 1, "search_category and search_gender must be a dict with one key"
+                        pass_parameters[key] = dict_value[0]
+                    else:
+                        pass_parameters[key] = value.value
                 else:
                     pass_parameters[key] = value
         result = variable_schema.search_voice_library(**pass_parameters)
@@ -589,13 +750,13 @@ class SearchVoiceTransition(Transition):
                                                 latest_call = self.calling_timestamp,
                                                 updated = True,
                                                 created_by = f"{self.name}@{self.calling_timestamp}",
-                                                variable_type = VoiceLocalVariableType.VOICE_TYPE)
+                                                variable_type = VoiceLocalVariableType.VOICE_RETURN_CONTENT)
             new_local_variable.is_indexed = True
             new_local_variable.transitions = copy.deepcopy(longest_transitions)
-            new_local_variable.transitions.append([self.__class__.__name__, 
-                                                   {'search_name': self.parameters["search_name"], 
-                                                    "search_category": self.parameters["search_category"],
-                                                    "search_gender": self.parameters["search_gender"]}])
+            new_local_variable.transitions.append({"name": self.__class__.__name__, 
+                                                   "parameters": {
+                                                    "search_category": pass_parameters["search_category"],
+                                                    "search_gender": pass_parameters["search_gender"]}})
             variable_schema.add_local_variable(new_local_variable)
         
     def __str__(self):
@@ -603,11 +764,6 @@ class SearchVoiceTransition(Transition):
 
     def get_program_str(self) -> Tuple[List[str], str]:
         parameter_str = ""
-        if self.parameters["search_name"] is not None:
-            if isinstance(self.parameters["search_name"], LocalVariable):
-                parameter_str += f"search_name={self.parameters['search_name'].name}, "
-            else:
-                parameter_str += f"search_name={self.parameters['search_name']}, "
         if self.parameters["search_category"] is not None:
             if isinstance(self.parameters["search_category"], LocalVariable):
                 parameter_str += f"search_category={self.parameters['search_category'].name}, "
@@ -630,6 +786,7 @@ class TextToSpeechTransition(Transition):
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {}
+        self.search_index = False
         if "text_modification" in parameters:
             assert parameters["text_modification"] == "split", "text_modification must be split"
             assert isinstance(parameters["text"], LocalVariable), "text must be a LocalVariable"
@@ -654,7 +811,9 @@ class TextToSpeechTransition(Transition):
             for local_idx in range(len(variable_schema.local_states["variables"])-1, -1, -1):
                 if variable_schema.local_states["variables"][local_idx].name == name:
                     local_states.append(local_idx)
-                    break
+                if isinstance(self.parameters["voice_name"], LocalVariable):
+                    if variable_schema.local_states["variables"][local_idx].name == self.parameters["voice_name"].name:
+                        local_states.append(local_idx)
         
         return implicit_states, local_states
     
@@ -668,10 +827,16 @@ class TextToSpeechTransition(Transition):
             if key not in self.get_required_parameters():
                 continue
             if isinstance(value, LocalVariable):
-                if value.variable_type == VoiceLocalVariableType.VOICE_TYPE:
+                if value.variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                     temp_name = value.name
+                    assert key == "voice_name", "voice_name must be a LocalVariable"
+                    assert value.is_indexed, "voice_name must be indexed"
                     pass_parameters[key] = value.value['voice_name']
-                    self.string_parameters[key] = f"{temp_name}['voice_name']"
+                    if "[0]" in temp_name:
+                        self.string_parameters[key] = f"{temp_name}['voice_name']"
+                    else:
+                        self.search_index = True
+                        self.string_parameters[key] = LOOP_VARIABLE
                 else:
                     pass_parameters[key] = value.value
                     self.string_parameters[key] = value.name
@@ -691,11 +856,12 @@ class TextToSpeechTransition(Transition):
                                      voice_value=result,
                                      outbound=False)
         new_voice_state.transitions = copy.deepcopy(longest_transitions)
-        new_voice_state.transitions.append([self.__class__.__name__, {'text': self.parameters["text"], 
-                                                               "voice_name": self.parameters["voice_name"],
+        new_voice_state.transitions.append({"name": self.__class__.__name__, 
+                                            "parameters": {'text': self.string_parameters["text"], 
+                                                               "voice_name": self.string_parameters["voice_name"] if "voice_name" in self.string_parameters else None,
                                                                "stability": self.parameters["stability"],
                                                                "similarity_boost": self.parameters["similarity_boost"],
-                                                               "style": self.parameters["style"]}])
+                                                               "style": self.parameters["style"]}})
         new_local_variable = LocalVariable(name=self.new_variable_name,
                                           value=new_voice_state,
                                           latest_call=self.calling_timestamp,
@@ -715,6 +881,15 @@ class TextToSpeechTransition(Transition):
             parameter_str += f"{key}={value}, "
         parameter_str = parameter_str.rstrip(", ")
         result = []
+        if self.search_index:
+            loop_body = self.parameters["voice_name"].name.split("[")[0]
+            loop_pointer = self.string_parameters["voice_name"]
+            voice_name_category = self.parameters["voice_name"].value["category"]
+            voice_name_gender = self.parameters["voice_name"].value["gender"]
+            result.append(f"for i in {loop_body}:\n")
+            result.append(f"{INDENT}if i[\"category\"] == \"{voice_name_category}\" and i[\"gender\"] == \"{voice_name_gender}\":\n")
+            result.append(f"{INDENT}{INDENT}{loop_pointer} = i[\"voice_name\"]\n")
+            result.append(f"{INDENT}{INDENT}break\n")
         if "text_modification" in self.parameters and self.parameters["text_modification"] == "split":
             result.append(f"{self.parameters['text'].name} = {self.parameters['text'].name}.split('.')[0] + '.'\n")
         result.append(f"{self.new_variable_name} = text_to_speech({parameter_str})\n")
@@ -727,6 +902,7 @@ class SpeechToSpeechTransition(Transition):
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {}
+        self.search_index = False
         assert "input_speech" in self.parameters, "input_speech is required"
         assert isinstance(self.parameters["input_speech"], LocalVariable), "input_speech must be a LocalVariable"
         assert self.parameters["voice_name"] is not None, "voice_name is required"
@@ -748,10 +924,14 @@ class SpeechToSpeechTransition(Transition):
             if self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_NAME:
                 voice_name = self.parameters["voice_name"].name
                 self.string_parameters["voice_name"] = voice_name
-            elif self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_TYPE:
+            elif self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                 temp_name = self.parameters['voice_name'].name
-                voice_name = f"{temp_name}['voice_name']" # Return of search_voice_library
-                self.string_parameters["voice_name"] = voice_name
+                if "[0]" in temp_name:
+                    voice_name = f"{temp_name}['voice_name']" # Return of search_voice_library
+                    self.string_parameters["voice_name"] = voice_name
+                else:
+                    self.search_index = True
+                    self.string_parameters["voice_name"] = LOOP_VARIABLE
         else:
             self.string_parameters["voice_name"] = f'"{self.parameters["voice_name"]}"'
         for local_idx in range(len(variable_schema.local_states["variables"])-1, -1, -1):
@@ -766,6 +946,23 @@ class SpeechToSpeechTransition(Transition):
         implicit_states.append(input_speech_name)
         return implicit_states, local_states
     
+    @staticmethod
+    def process_parameters(parameters: Dict[str, Any]):
+        if isinstance(parameters["voice_name"], str):
+            voice_name = parameters["voice_name"]
+        else:
+            if parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_NAME:
+                if isinstance(parameters["voice_name"].value, dict):
+                    dict_value = list(parameters["voice_name"].value.values())
+                    assert len(dict_value) == 1, "voice_name must be a dict with one key"
+                    voice_name = dict_value[0]
+                else:
+                    voice_name = parameters["voice_name"].value
+            elif parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
+                voice_name = parameters["voice_name"].value["voice_name"] # Return of search_voice_library
+        pass_parameters = {"input_speech": parameters["input_speech"].value.current_value["voice_value"], "voice_name": voice_name}
+        return pass_parameters
+    
     def apply(self, implicit_states, local_states, variable_schema: VoiceVariableSchema):
         for l_state in local_states:
             variable_schema.local_states["variables"][l_state].latest_call = self.calling_timestamp
@@ -773,14 +970,8 @@ class SpeechToSpeechTransition(Transition):
         for i_state in implicit_states:
             variable_schema.implicit_states["latest_call"][i_state] = self.calling_timestamp
             #variable_schema.implicit_states["voice_info"][i_state].updated = False
-        if isinstance(self.parameters["voice_name"], str):
-            voice_name = self.parameters["voice_name"]
-        else:
-            if self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_NAME:
-                voice_name = self.parameters["voice_name"].value
-            elif self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_TYPE:
-                voice_name = self.parameters["voice_name"].value["voice_name"] # Return of search_voice_library
-        pass_parameters = {"input_speech": self.parameters["input_speech"].value.current_value["voice_value"], "voice_name": voice_name}
+
+        pass_parameters = SpeechToSpeechTransition.process_parameters(self.parameters)
         result = variable_schema.speech_to_speech(**pass_parameters)
         
         
@@ -790,7 +981,8 @@ class SpeechToSpeechTransition(Transition):
                                      outbound=False
                                      )
         new_voice_state.transitions = copy.deepcopy(self.parameters["input_speech"].value.transitions)
-        new_voice_state.transitions.append([self.__class__.__name__, {'input_speech': self.parameters["input_speech"].name, "voice_name": voice_name}])
+        new_voice_state.transitions.append({"name": self.__class__.__name__, 
+                                            "parameters": pass_parameters})
         variable_schema.add_implicit_variable(new_voice_state, self.calling_timestamp)
         new_local_variable = LocalVariable(name=self.new_variable_name,
                                           value=new_voice_state,
@@ -802,16 +994,27 @@ class SpeechToSpeechTransition(Transition):
         variable_schema.add_local_variable(new_local_variable)
     
     def __str__(self):
-        return f"SpeechToSpeechTransition(parameters={self.parameters}, calling_timestamp={self.calling_timestamp}, new_variable_name={self.new_variable_name})"
+        return f"SpeechToSpeechTransition(parameters={self.parameters}, calling_timestamp={self.calling_timestamp}, new_variable_name={self.new_variable_name}, string_parameters={self.string_parameters})"
     
     def get_program_str(self) -> Tuple[List[str], str]:
         parameter_str = ""
         for key, value in self.string_parameters.items():
             parameter_str += f"{key}={value}, "
         parameter_str = parameter_str.rstrip(", ")
-        result = [
-            f"{self.new_variable_name} = speech_to_speech({parameter_str})",
-        ] 
+        if self.search_index:
+            loop_body = self.parameters["voice_name"].name.split("[")[0]
+            loop_pointer = self.string_parameters["voice_name"]
+            voice_name_category = self.parameters["voice_name"].value["category"]
+            voice_name_gender = self.parameters["voice_name"].value["gender"]
+            result = [
+                f"for i in {loop_body}:\n",
+                f"{INDENT}if i[\"category\"] == \"{voice_name_category}\" and i[\"gender\"] == \"{voice_name_gender}\":\n",
+                f"{INDENT}{INDENT}{loop_pointer} = i[\"voice_name\"]\n",
+                f"{INDENT}{INDENT}break\n",
+            ]
+        else:
+            result = []
+        result.append(f"{self.new_variable_name} = speech_to_speech({parameter_str})\n")
         return result, ""
 
 class SpeechToTextTransition(Transition):
@@ -839,6 +1042,12 @@ class SpeechToTextTransition(Transition):
         implicit_states.append(input_speech_name)
         return implicit_states, local_states
     
+    @staticmethod
+    def process_parameters(parameters: Dict[str, Any]):
+        pass_parameters = {"input_speech": parameters["input_speech"].value.current_value["voice_value"], 
+                           "diarize": parameters["diarize"]}
+        return pass_parameters
+    
     def apply(self, implicit_states, local_states, variable_schema: VoiceVariableSchema):
         for l_state in local_states:
             variable_schema.local_states["variables"][l_state].latest_call = self.calling_timestamp
@@ -853,7 +1062,7 @@ class SpeechToTextTransition(Transition):
         #                                        "diarize": self.parameters["diarize"]}]
         #                                      )
         
-        pass_parameters = {"input_speech": self.parameters["input_speech"].value.current_value["voice_value"], "diarize": self.parameters["diarize"]}
+        pass_parameters = SpeechToTextTransition.process_parameters(self.parameters)
         result = variable_schema.speech_to_text(**pass_parameters)
         new_local_variable = LocalVariable(name=self.new_variable_name,
                                           value=result,
@@ -862,9 +1071,8 @@ class SpeechToTextTransition(Transition):
                                           created_by=f"{self.name}@{self.calling_timestamp}",
                                           variable_type=VoiceLocalVariableType.VOICE_TRANSCRIPTION)
         new_local_variable.transitions = copy.deepcopy(implicit_state.transitions)
-        new_local_variable.transitions.append([self.__class__.__name__, 
-                                               {'input_speech': self.parameters["input_speech"].name, 
-                                                "diarize": self.parameters["diarize"]}])
+        new_local_variable.transitions.append({"name": self.__class__.__name__, 
+                                               "parameters": pass_parameters})
         variable_schema.add_local_variable(new_local_variable)
     
     def __str__(self):
@@ -876,7 +1084,7 @@ class SpeechToTextTransition(Transition):
             parameter_str += f"{key}={value}, "
         parameter_str = parameter_str.rstrip(", ")
         result = [
-            f"{self.new_variable_name} = speech_to_text({parameter_str})",
+            f"{self.new_variable_name} = speech_to_text({parameter_str})\n",
         ] 
         return result, ""
         
@@ -923,7 +1131,8 @@ class IsolateAudioTransition(Transition):
                                           voice_value=result,
                                           outbound=False)
         new_implicit_variable.transitions = copy.deepcopy(implicit_state.transitions)
-        new_implicit_variable.transitions.append([self.__class__.__name__, {'input_speech': self.parameters["input_speech"].name}])
+        new_implicit_variable.transitions.append({"name": self.__class__.__name__, 
+                                                 "parameters": {'input_speech': self.parameters["input_speech"].name}})
         variable_schema.add_implicit_variable(new_implicit_variable, self.calling_timestamp)
         
         #implicit_state.transitions.append(["isolate_audio", {'input_speech': self.parameters["input_speech"].name}])
@@ -945,7 +1154,7 @@ class IsolateAudioTransition(Transition):
             parameter_str += f"{key}={value}, "
         parameter_str = parameter_str.rstrip(", ")
         result = [
-            f"{self.new_variable_name} = isolate_audio({parameter_str})",
+            f"{self.new_variable_name} = isolate_audio({parameter_str})\n",
         ] 
         return result, ""
 
@@ -955,6 +1164,7 @@ class MakeOutboundCallTransition(Transition):
         self.calling_timestamp = calling_timestamp
         self.new_variable_name = RESPONSE_VARIABLE_TEMP.format(self.calling_timestamp)
         self.string_parameters = {}
+        self.search_index = False
         assert "input_speech" in self.parameters, "input_speech is required"
         assert isinstance(self.parameters["input_speech"], LocalVariable), "input_speech must be a LocalVariable"
         assert self.parameters["voice_name"] is not None, "voice_name is required"
@@ -972,36 +1182,75 @@ class MakeOutboundCallTransition(Transition):
         else:
             if self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_NAME:
                 voice_name = self.parameters["voice_name"].name
-            elif self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_TYPE:
+            elif self.parameters["voice_name"].variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                 temp_name = self.parameters['voice_name'].name
-                voice_name = f"{temp_name}['voice_name']" # Return of search_voice_library
+                if "[0]" in temp_name:
+                    voice_name = f"{temp_name}['voice_name']" # Return of search_voice_library
+                else:
+                    self.search_index = True
+                    self.string_parameters["voice_name"] = LOOP_VARIABLE
+                    voice_name = LOOP_VARIABLE
         self.string_parameters["voice_name"] = voice_name
         
+        if isinstance(self.parameters["voice_name"], LocalVariable):
+            local_states = [None, None]
+        else:
+            local_states = [None]
         for local_idx in range(len(variable_schema.local_states["variables"])-1, -1, -1):
-            if variable_schema.local_states["variables"][local_idx].name == input_speech_name:
-                local_states.append(local_idx)
-                break
+            if variable_schema.local_states["variables"][local_idx].name == input_speech_name and variable_schema.local_states["variables"][local_idx].variable_type == VoiceLocalVariableType.STATE:
+                local_states[0] = local_idx
+            if isinstance(self.parameters["voice_name"], LocalVariable) and variable_schema.local_states["variables"][local_idx].name == self.parameters["voice_name"].name:
+                local_states[1] = local_idx
         implicit_states.append(input_speech_name)
         return implicit_states, local_states
     
+    @staticmethod
+    def process_parameters(parameters: Dict[str, Any]):
+        voice_name = parameters["voice_name"]
+        if isinstance(voice_name, str):
+            pass
+        elif isinstance(voice_name, LocalVariable) and voice_name.variable_type == VoiceLocalVariableType.VOICE_NAME:
+            if isinstance(voice_name.value, dict):
+                dict_value = list(voice_name.value.values())
+                assert len(dict_value) == 1, "voice_name must be a dict with one key"
+                voice_name = dict_value[0]
+            else:
+                voice_name = voice_name.value
+        elif isinstance(voice_name, LocalVariable) and voice_name.variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
+            voice_name = voice_name.value["voice_name"]
+        else:
+            raise ValueError(f"Invalid voice_name type: {type(voice_name)}")
+        pass_parameters = {"input_speech": parameters["input_speech"].value.current_value["voice_value"], "voice_name": voice_name}
+        assert isinstance(pass_parameters["input_speech"], Speech), "input_speech must be a Speech, but got {type(pass_parameters['input_speech'])}"
+        assert isinstance(pass_parameters["voice_name"], str), "voice_name must be a str, but got {type(pass_parameters['voice_name'])}"
+        return pass_parameters
+    
     def apply(self, implicit_states, local_states, variable_schema: VoiceVariableSchema):
         assert len(implicit_states) == 1, "There should be only one implicit state for make_outbound_call"
-        assert len(local_states) == 1, "There should be only one local state for make_outbound_call"
+        #assert len(local_states) == 1, "There should be only one local state for make_outbound_call"
         implicit_state = variable_schema.implicit_states["voice_info"][implicit_states[0]]
         variable_schema.implicit_states["latest_call"][implicit_state.identifier] = self.calling_timestamp
         implicit_state.current_value["outbound"] = True
-        implicit_state.transitions.append([self.__class__.__name__, 
-                                           {'input_speech': self.parameters["input_speech"].name,
-                                            "voice_name": self.parameters["voice_name"]}]
+
+        pass_parameters = MakeOutboundCallTransition.process_parameters(self.parameters)
+        implicit_state.transitions.append({"name": self.__class__.__name__, 
+                                           "parameters": pass_parameters}
                                           )
-        pass_parameters = {"input_speech": self.parameters["input_speech"].value.current_value["voice_value"], "voice_name": self.parameters["voice_name"]}
+
         result = variable_schema.make_outbound_call(**pass_parameters)
         assert result, "make_outbound_call failed"
-        assert variable_schema.local_states["variables"][local_states[0]].variable_type == VoiceLocalVariableType.STATE, "local_state should be a VoiceState"
+        #assert variable_schema.local_states["variables"][local_states[0]].variable_type == VoiceLocalVariableType.STATE, "local_state should be a VoiceState"
         variable_schema.local_states["variables"][local_states[0]].latest_call = self.calling_timestamp
         variable_schema.local_states["variables"][local_states[0]].updated = False
         variable_schema.local_states["variables"][local_states[0]].value = copy.deepcopy(implicit_state)
         variable_schema.local_states["variables"][local_states[0]].transitions = copy.deepcopy(implicit_state.transitions)
+        
+        if len(local_states) == 2:
+            variable_schema.local_states["variables"][local_states[1]].latest_call = self.calling_timestamp
+            variable_schema.local_states["variables"][local_states[1]].updated = False
+            variable_schema.local_states["variables"][local_states[1]].transitions.append({"name": self.__class__.__name__, 
+                                                                                           "parameters": pass_parameters}
+                                                                                          )
     
     def __str__(self):
         return f"MakeOutboundCallTransition(parameters={self.parameters}, calling_timestamp={self.calling_timestamp}, new_variable_name={self.new_variable_name})"
@@ -1011,9 +1260,20 @@ class MakeOutboundCallTransition(Transition):
         for key, value in self.string_parameters.items():
             parameter_str += f"{key}={value}, "
         parameter_str = parameter_str.rstrip(", ")
-        result = [
-            f"{self.new_variable_name} = make_outbound_call({parameter_str})",
-        ] 
+        if self.search_index:
+            loop_body = self.parameters["voice_name"].name.split("[")[0]
+            voice_name_category = self.parameters["voice_name"].value["category"]
+            voice_name_gender = self.parameters["voice_name"].value["gender"]
+            loop_pointer = self.string_parameters["voice_name"]
+            result = [
+                f"for i in {loop_body}:\n",
+                f"{INDENT}if i[\"category\"] == \"{voice_name_category}\" and i[\"gender\"] == \"{voice_name_gender}\":\n",
+                f"{INDENT}{INDENT}{loop_pointer} = i[\"voice_name\"]\n",
+                f"{INDENT}{INDENT}break\n",
+            ]
+        else:
+            result = []
+        result.append(f"{self.new_variable_name} = make_outbound_call({parameter_str})\n")
         return result, ""
 
 
@@ -1021,18 +1281,18 @@ def test_search_voice_library():
     schema = VoiceVariableSchema()
     new_local_variable = LocalVariable(
         name="user_variable_1",
-        value="Emma",
+        value="conversational",
         latest_call=0,
         updated=True,
         created_by="user",
-        variable_type=VoiceLocalVariableType.VOICE_NAME
+        variable_type=VoiceLocalVariableType.VOICE_SEARCH_CONTENT
     )
-    transition = SearchVoiceTransition({"search_name": new_local_variable, "search_category": None, "search_gender": None}, 1)
+    transition = SearchVoiceTransition({"search_category": new_local_variable, "search_gender": None}, 1)
     implicit_states, local_states = transition.get_effected_states(schema)
     transition.apply(implicit_states, local_states, schema)
     assert len(schema.local_states['variables']) == 1
 
-    transition = SearchVoiceTransition({"search_name": None, "search_category": "conversational", "search_gender": None}, 2)
+    transition = SearchVoiceTransition({"search_category": "conversational", "search_gender": None}, 2)
     implicit_states, local_states = transition.get_effected_states(schema)
     transition.apply(implicit_states, local_states, schema)
     assert schema.local_states['variables'][-1].name == 'response_2[2]'
