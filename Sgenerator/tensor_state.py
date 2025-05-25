@@ -529,6 +529,7 @@ class TensorVariableSchema(Schema):
          Return:
             if_condition: The condition for the if-else transition.
             whether_replace_by_variable: Whether the if-else transition is replaced by a variable.
+            additional_content: Additional statement for the if-else transition.
         """
         condition_types = [
             'shape', 'value', 'dtype'
@@ -558,7 +559,7 @@ class TensorVariableSchema(Schema):
                 right_value = torch.sum(tensor > torch.mean(tensor)).item()
                 if_condition = (f"torch.sum({local_var.name} > torch.mean({local_var.name}))", None, right_value)
             
-        return if_condition, whether_replace_by_variable
+        return if_condition, whether_replace_by_variable, None
     
 class Conv2dTransition(Transition):
     """Handles tensor concatenation"""

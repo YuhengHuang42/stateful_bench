@@ -359,13 +359,15 @@ class TraceGenerator:
     
     def generate_trace(self, 
                        call_num, 
-                       this_trace_duplicate_local_variable_map=dict(), 
+                       this_trace_duplicate_local_variable_map=None, 
                        disable_postprocess=False, 
                        base_call_num=0,
                        enable_coverage=True):
         # 1. Two function calls with exact same parameters should be avoided.
         # 2. Increase pair coverage as much as possible.
         # Data structure that being effected: self.occurence_book, self.trace, self.state_schema, self.random_generator
+        if this_trace_duplicate_local_variable_map is None:
+            this_trace_duplicate_local_variable_map = dict()
         previous_transition_info = None
         trace = []
         trace_str = []
@@ -529,7 +531,6 @@ class TraceGenerator:
                 trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
                 trace_str.append(new_transition.get_program_str())
                 previous_transition_info = (selected[0], target_transition_info["required_parameters"]) # (Transition, parameters)
-        
         return (trace, trace_str), this_trace_duplicate_local_variable_map, True
 
 
@@ -601,17 +602,20 @@ def generate_program(trace_generator: TraceGenerator,
             "main": None,
             "if": None,
             "else": None,
-        }
+        },
+        "debug_info": None
     }
     is_success = True
     occurence_book_backup = copy.deepcopy(trace_generator.occurence_book)
     result_variable_flag = False
     if not enable_if_else:
         trace, this_trace_duplicate_local_variable_map, is_success = trace_generator.generate_trace(trace_length, 
-                                                                                                    disable_postprocess=False, 
+                                                                                                    disable_postprocess=False,
+                                                                                                    this_trace_duplicate_local_variable_map=dict(),
                                                                                                     enable_coverage=enable_coverage)
         if not is_success:
             result["occurence_book"] = occurence_book_backup
+            result["debug_info"] = [trace, trace_generator]
             return result, is_success
         result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
         program = synthesize_trace_str("", trace)
@@ -635,9 +639,11 @@ def generate_program(trace_generator: TraceGenerator,
             # Left here for diversity.
             trace, this_trace_duplicate_local_variable_map, is_success = trace_generator.generate_trace(trace_length, 
                                                                                                     disable_postprocess=False, 
+                                                                                                    this_trace_duplicate_local_variable_map=dict(),
                                                                                                     enable_coverage=enable_coverage)
             if not is_success:
                 result["occurence_book"] = occurence_book_backup
+                result["debug_info"] = [trace, trace_generator]
                 return result, is_success
             result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
             program = synthesize_trace_str("", trace)
@@ -656,9 +662,11 @@ def generate_program(trace_generator: TraceGenerator,
             if control_position != 0:
                 trace, this_trace_duplicate_local_variable_map, is_success = trace_generator.generate_trace(control_position, 
                                                                                                             disable_postprocess=True,
+                                                                                                            this_trace_duplicate_local_variable_map=dict(),
                                                                                                             enable_coverage=enable_coverage)
                 if not is_success:
                     result["occurence_book"] = occurence_book_backup
+                    result["debug_info"] = [trace, trace_generator]
                     return result, is_success
                 program = synthesize_trace_str(program, trace)
                 result["main_trace"] = [trace, trace_generator.state_schema.get_implicit_states()]
@@ -666,9 +674,14 @@ def generate_program(trace_generator: TraceGenerator,
             else:
                 this_trace_duplicate_local_variable_map = dict()
             disable_postprocess = random.random() < 0.5
-            if_condition, whether_replace_by_variable = trace_generator.state_schema.obtain_if_condition()
+            if_condition, whether_replace_by_variable, additional_content = trace_generator.state_schema.obtain_if_condition()
             if whether_replace_by_variable:
                 if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2])
+                if already_exist:
+                    if if_condition_name == if_condition[2]:
+                        # Trivial if-else, change name
+                        # Fix this if more if-else is introduced for program generation.
+                        if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2], name="condition_variable")
             else:
                 if_condition_name = if_condition[2]
             if isinstance(if_condition[1], tuple) or isinstance(if_condition[1], list):
@@ -676,17 +689,22 @@ def generate_program(trace_generator: TraceGenerator,
             else:
                 if_string = f"if {if_condition[0]} == {if_condition_name}:\n"
             
-            
+            if additional_content is not None:
+                additional_text = "".join(additional_content[0])
+                if_string = additional_text + if_string
             if_trace_generator = copy.deepcopy(trace_generator)
             else_trace_generator = copy.deepcopy(trace_generator)
-            if_trace, if_this_trace_duplicate_local_variable_map, is_success = if_trace_generator.generate_trace(trace_length - control_position,
-                                                                                                     this_trace_duplicate_local_variable_map, 
-                                                                                                     disable_postprocess=disable_postprocess,
-                                                                                                     base_call_num=control_position,
-                                                                                                     enable_coverage=enable_coverage)
+            if_trace, if_this_trace_duplicate_local_variable_map, is_success = if_trace_generator.generate_trace(
+                trace_length - control_position,
+                this_trace_duplicate_local_variable_map, 
+                disable_postprocess=disable_postprocess,
+                base_call_num=control_position,
+                enable_coverage=enable_coverage
+            )
             result["state_schema"]["if"] = if_trace_generator.state_schema
             if not is_success:
                 result["occurence_book"] = occurence_book_backup
+                result["debug_info"] = [if_trace, if_trace_generator]
                 return result, is_success
             program = synthesize_trace_str(program, if_trace, if_string, INDENT, block_ending="\n\n")
             result["if_trace"] = [if_trace, if_trace_generator.state_schema.get_implicit_states()]
@@ -714,6 +732,7 @@ def generate_program(trace_generator: TraceGenerator,
             result["state_schema"]["else"] = else_trace_generator.state_schema
             if not is_success:
                 result["occurence_book"] = occurence_book_backup
+                result["debug_info"] = [else_trace, else_trace_generator]
                 return result, is_success
             result["else_trace"] = [else_trace, else_trace_generator.state_schema.get_implicit_states()]
             result["occurence_book"] = copy.deepcopy(else_trace_generator.occurence_book)

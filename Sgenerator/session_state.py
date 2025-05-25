@@ -405,6 +405,7 @@ class SessionVariableSchema(Schema):
         Return:
             if_condition: The condition for the if-else transition.
             whether_replace_by_variable: Whether the if-else transition is replaced by a variable.
+            additional_content: Additional statement for the if-else transition.
         """
         if_condition = None
         for idx in range(len(self.local_states["variables"])-1, -1, -1):
@@ -447,7 +448,7 @@ class SessionVariableSchema(Schema):
                 field = random.choice(list(local_variable.value.current_value["data"].keys()))  
                 if_condition = (local_variable.name, ("data", field), local_variable.value.current_value["data"][field])
                 break
-        return if_condition, True
+        return if_condition, True, None
             
                 
     
