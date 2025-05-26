@@ -51,6 +51,31 @@ class Speech:
                 for i in range(len(self.transitions))
             )
         )
+    
+    def to_json(self) -> dict:
+        """Convert Speech object to JSON-serializable dictionary"""
+        return {
+            "text": self.text,
+            "voice_name": self.voice_name,
+            "stability": self.stability,
+            "similarity_boost": self.similarity_boost,
+            "style": self.style,
+            "duration": self.duration,
+            "transitions": self.transitions
+        }
+    
+    @classmethod
+    def from_json(cls, data: dict) -> "Speech":
+        """Create Speech object from JSON-serializable dictionary"""
+        return cls(
+            text=data["text"],
+            voice_name=data["voice_name"],
+            stability=data["stability"],
+            similarity_boost=data["similarity_boost"],
+            style=data["style"],
+            duration=data["duration"],
+            transitions=data["transitions"]
+        )
 
 class OutboundCallRecorder:
     def __init__(self):

@@ -4,12 +4,24 @@ import copy
 from enum import Enum
 from faker import Faker
 import random
+from loguru import logger
+import traceback
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
 from Sgenerator.state import INDENT, RESULT_NAME, ProgramEvaluator, LocalVariable
 from Sgenerator import voice_lab
 from Sgenerator.voice_lab import Speech
+
+from Sgenerator.voice_lab import (
+    speech_to_speech,
+    text_to_speech,
+    speech_to_text,
+    isolate_audio,
+    make_outbound_call,
+    search_voice_library,
+    Speech,
+)
 
 INIT_VOICE = "user_voice"
 LOOP_VARIABLE = "voice_item"
@@ -183,7 +195,7 @@ class VoiceVariableSchema(Schema):
             for i in range(voice_range):
                 voice = random_generator.random_generate_state()
                 voice.identifier = f"{voice.identifier}_{len(self.init_load_info)}_load"
-                self.init_load_info[voice.identifier] = voice
+                self.init_load_info[voice.identifier] = voice.initial_value["voice_value"]
                 new_local_variable = LocalVariable(name=voice.identifier,
                                                 value=voice,
                                                 latest_call=0,
@@ -220,7 +232,7 @@ class VoiceVariableSchema(Schema):
                                                 created_by=USER_FUNCTION_PARAM_FLAG,
                                                 variable_type=VoiceLocalVariableType.STATE
                                                 )
-                self.init_load_info[voice.identifier] = new_local_variable.value
+                self.init_load_info[voice.identifier] = new_local_variable.value.initial_value["voice_value"]
                 self.add_local_variable(new_local_variable)
                 self.add_implicit_variable(voice, 0)
         voice_name = random_generator.random_generate_voice_term()
@@ -257,22 +269,37 @@ class VoiceVariableSchema(Schema):
     
     def postprocess_choose_result(self):
         result_var_list = []
+        index_book = set()
         for idx in range(len(self.local_states["variables"])-1, -1, -1):
             local_variable = self.local_states["variables"][idx]
             #transitions = local_variable.value.transitions
             if local_variable.updated == True:
                 # Either being updated or being queried.
                 #result_str = f"{RESULT_NAME} = {local_variable.name}"
-                result_var_list.append(local_variable)
+                if local_variable.is_indexed:
+                    local_variable_name = local_variable.name.split("[")[0]
+                    if local_variable_name in index_book:
+                        continue
+                    index_book.add(local_variable_name)
+                    result_var_list.append(local_variable_name)
+                else:
+                    result_var_list.append(local_variable)
         if len(result_var_list) == 0:
             return None
         elif len(result_var_list) == 1:
-            return f"{RESULT_NAME} = {result_var_list[0].name}"
+            if isinstance(result_var_list[0], LocalVariable):
+                return f"{RESULT_NAME} = {result_var_list[0].name}"
+            else:
+                return f"{RESULT_NAME} = {result_var_list[0]}"
         else:
-            result_str = f"{RESULT_NAME} = "
+            result_str = f"{RESULT_NAME} = ("
             for idx, result_var in enumerate(result_var_list):
-                result_str += f"{result_var.name}, "
+                if isinstance(result_var, LocalVariable):
+                    result_str += f"{result_var.name}, "
+                else:
+                    result_str += f"{result_var}, "
             result_str = result_str[:-2]
+            result_str += ")"
             return result_str
     
     def postprocess_transitions(self, remaining_call: int) -> Tuple[bool, List[str]]:
@@ -406,7 +433,9 @@ class VoiceVariableSchema(Schema):
             elif local_variable.variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
                 assert local_variable.is_indexed
                 search_statements = ["found_flag = False\n"]
-                search_statements.append(f"for i in {local_variable.name}:\n")
+                local_variable_name = local_variable.name
+                local_variable_name = local_variable_name.split("[")[0]
+                search_statements.append(f"for i in {local_variable_name}:\n")
                 search_statements.append(f"{INDENT}if i['category'] == \"{local_variable.value['category']}\" and i['gender'] == \"{local_variable.value['gender']}\":\n")
                 search_statements.append(f"{INDENT}{INDENT}found_flag = True\n")
                 search_statements.append(f"{INDENT}{INDENT}break\n")
@@ -711,7 +740,12 @@ class VoiceVariableSchema(Schema):
                                                    )
                 local_constant_value = new_local_variable.value
                 if isinstance(local_constant_value, str):
-                    local_constant_value = f"\"{local_constant_value}\""
+                    pass
+                elif isinstance(local_constant_value, dict):
+                    if len(local_constant_value) == 1:
+                        local_constant_value = list(local_constant_value.values())[0]
+                    else:
+                        raise Exception(f"Voice name must be a string or a dict with one key, but got {type(local_constant_value)}")
                 self.add_local_constant(local_constant_value)
                 self.add_local_variable(new_local_variable)
                 transition_info["required_parameters"]["voice_name"] = new_local_variable
@@ -730,7 +764,12 @@ class VoiceVariableSchema(Schema):
                                                    )
                 local_constant_value = new_local_variable.value
                 if isinstance(local_constant_value, str):
-                    local_constant_value = f"\"{local_constant_value}\""
+                    pass
+                elif isinstance(local_constant_value, dict):
+                    if len(local_constant_value) == 1:
+                        local_constant_value = list(local_constant_value.values())[0]
+                    else:
+                        raise Exception(f"Voice name must be a string or a dict with one key, but got {type(local_constant_value)}")
                 self.add_local_constant(local_constant_value)
                 self.add_local_variable(new_local_variable)
                 transition_info["required_parameters"]["voice_name"] = new_local_variable
@@ -796,8 +835,8 @@ class SearchVoiceTransition(Transition):
                 self.string_parameters["search_category"] = f'"{search_category}"'
                 self.string_parameters["search_gender"] = f'"{search_gender}"'
             elif isinstance(search_category, LocalVariable) and isinstance(search_gender, LocalVariable):
-                self.string_parameters["search_category"] = f"{search_category.name}['voice_category']"
-                self.string_parameters["search_gender"] = f"{search_gender.name}['voice_gender']"
+                self.string_parameters["search_category"] = f"{search_category.name}['search_category']"
+                self.string_parameters["search_gender"] = f"{search_gender.name}['search_gender']"
                 variable_list.append(search_category.name)
                 variable_list.append(search_gender.name)
             else:
@@ -895,6 +934,7 @@ class SearchVoiceTransition(Transition):
 
     def get_program_str(self) -> Tuple[List[str], str]:
         parameter_str = ""
+        '''
         if self.parameters["search_category"] is not None:
             if isinstance(self.parameters["search_category"], LocalVariable):
                 parameter_str += f"search_category={self.parameters['search_category'].name}, "
@@ -905,6 +945,9 @@ class SearchVoiceTransition(Transition):
                 parameter_str += f"search_gender={self.parameters['search_gender'].name}, "
             else:
                 parameter_str += f"search_gender={self.parameters['search_gender']}, "
+        '''
+        for key, value in self.string_parameters.items():
+            parameter_str += f"{key}={value}, "
         parameter_str = parameter_str.rstrip(", ")
         result = [
             f"{self.new_variable_name} = search_voice_library({parameter_str})\n",
@@ -1407,6 +1450,67 @@ class MakeOutboundCallTransition(Transition):
         result.append(f"{self.new_variable_name} = make_outbound_call({parameter_str})\n")
         return result, ""
 
+
+class VoiceEvaluator(ProgramEvaluator):
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.test_cases = []
+        self.preload_info = {
+            "speech_to_speech": speech_to_speech,
+            "text_to_speech": text_to_speech,
+            "speech_to_text": speech_to_text,
+            "isolate_audio": isolate_audio,
+            "make_outbound_call": make_outbound_call,
+            "Speech": Speech,
+            "search_voice_library": search_voice_library
+        }
+        
+    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
+        # 
+        voice_lab.voice_library.reset()
+        voice_lab.call_recorder.reset()
+        
+    
+    def collect_test_case(self, program_info, program):
+        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_info'], program_info["init_load_info"])
+        init_load_info = program_info["init_load_info"]
+        complete_program = program_info["init_local_str"] + program
+        namespace = {}
+        if init_load_info is not None:
+            for (name, value) in init_load_info:
+                namespace[name] = copy.deepcopy(value)
+                
+        for (name, value) in self.preload_info.items():
+            namespace[name] = value
+            
+        try:
+            exec(complete_program, namespace)
+        except Exception as e:
+            error_info = traceback.format_exc()
+            logger.warning(f"Error in executing the program: {error_info}")
+            return None
+        
+        if f"{RESULT_NAME}" in namespace:
+            result = namespace[RESULT_NAME]
+        else:
+            result = None
+        
+        if isinstance(result, Speech):
+            result = result.to_json()
+        
+        test_case = {
+            "result": result,
+            "state_oracle": None,
+            "program_info": program_info,
+            "program": program
+        }
+        self.test_cases.append(test_case)
+        return test_case
+            
+    def evaluate(self, program: str):
+        pass
+    
+     
 
 def test_search_voice_library():
     schema = VoiceVariableSchema()
