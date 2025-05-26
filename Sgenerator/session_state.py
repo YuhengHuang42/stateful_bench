@@ -1954,6 +1954,9 @@ class SessionEvaluator(ProgramEvaluator):
                     data = session["data"]
                     has_corresponding = False
                     for idx, oracle_session in enumerate(test_case["state_oracle"][source_type]):
+                        if local_oracle_list[idx] == 1:
+                            # Already matched
+                            continue
                         if data == oracle_session["data"]:
                             local_oracle_list[idx] += 1
                             has_corresponding = True

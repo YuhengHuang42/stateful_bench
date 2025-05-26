@@ -256,13 +256,13 @@ class Schema:
     def add_local_constant(self, value, name=None):
         already_exist = False
         if name is None:
+            for item in self.init_local_info:
+                if item[1] == value:
+                    already_exist = True
+                    return (item[0], already_exist)
             name = self.get_new_local_constant_name()
         if isinstance(value, str):    
             value = f"\"{value}\""
-        for item in self.init_local_info:
-            if item[1] == value:
-                already_exist = True
-                return (item[0], already_exist)
         self.init_local_info.append([name, value])
         return (name, already_exist)
     
@@ -678,10 +678,9 @@ def generate_program(trace_generator: TraceGenerator,
             if whether_replace_by_variable:
                 if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2])
                 if already_exist:
-                    if if_condition_name == if_condition[2]:
-                        # Trivial if-else, change name
-                        # Fix this if more if-else is introduced for program generation.
-                        if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2], name="condition_variable")
+                    # Trivial if-else, change name
+                    # Fix this if more if-else is introduced for program generation.
+                    if_condition_name, already_exist = trace_generator.state_schema.add_local_constant(if_condition[2], name="condition_variable")
             else:
                 if_condition_name = if_condition[2]
             if isinstance(if_condition[1], tuple) or isinstance(if_condition[1], list):

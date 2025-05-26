@@ -64,7 +64,7 @@ You are a checker agent tasked with evaluating the quality of a natural language
 Your output should be one of the following:
 	•	If the description satisfies all the criteria: <OK>
 	•	If any issues are found, provide a brief but specific diagnosis along with suggestions for improvement. Suggestions can be general (e.g., tone, structure) or targeted at a specific part of the description. Keep your feedback concise and actionable.
-
+    •	If you find it is impossible to generate a description that satisfies all the criteria, output <IMPOSSIBLE>
 Below is the program:
 ```
 # ===== Init Block Begin =====
@@ -271,7 +271,7 @@ class Evaluator():
         )
     
     def whether_continue(self, return_string):
-        if "<OK>" in return_string:
+        if "<OK>" in return_string or "<IMPOSSIBLE>" in return_string:
             return False
         else:
             return True

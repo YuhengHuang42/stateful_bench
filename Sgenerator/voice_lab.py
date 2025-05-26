@@ -37,13 +37,20 @@ class Speech:
         """Compare two Speech objects for equality"""
         if not isinstance(other, Speech):
             return False
+        def compare_float_or_none(a, b):
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
+                return False
+            return abs(a - b) < 1e-6
+
         return (
             self.text == other.text
             and self.voice_name == other.voice_name
-            and abs(self.stability - other.stability) < 1e-6
-            and abs(self.similarity_boost - other.similarity_boost) < 1e-6
-            and abs(self.style - other.style) < 1e-6
-            and abs(self.duration - other.duration) < 1e-6
+            and compare_float_or_none(self.stability, other.stability)
+            and compare_float_or_none(self.similarity_boost, other.similarity_boost)
+            and compare_float_or_none(self.style, other.style)
+            and compare_float_or_none(self.duration, other.duration)
             and len(self.transitions) == len(other.transitions)
             and all(
                 self.transitions[i][0] == other.transitions[i][0] 
@@ -61,7 +68,8 @@ class Speech:
             "similarity_boost": self.similarity_boost,
             "style": self.style,
             "duration": self.duration,
-            "transitions": self.transitions
+            "transitions": self.transitions,
+            "is_speech": True
         }
     
     @classmethod
@@ -97,6 +105,26 @@ class OutboundCallRecorder:
                     break
         return len(checked) == len(self.outbound_call_info)
 
+    def get_outbound_call_info(self) -> List[Tuple[Speech, str]]:
+        return_result = []
+        for item in self.outbound_call_info:
+            return_result.append([item[0].to_json(), item[1]])
+        return return_result
+    
+    @staticmethod
+    def compare_outbound_info(left, right):
+        if left[1] != right[1]:
+            return False
+        if isinstance(left[0], dict):
+            left_speech = Speech.from_json(left[0])
+        if isinstance(right[0], dict):
+            right_speech = Speech.from_json(right[0])
+        if left_speech != right_speech:
+            return False
+        else:
+            return True
+    
+    
     def reset(self):
         self.__init__()
     

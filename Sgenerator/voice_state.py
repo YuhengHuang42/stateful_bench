@@ -6,6 +6,7 @@ from faker import Faker
 import random
 from loguru import logger
 import traceback
+import json
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
@@ -427,7 +428,11 @@ class VoiceVariableSchema(Schema):
         for idx in range(len(self.local_states["variables"])-1, -1, -1):
             local_variable = self.local_states["variables"][idx]
             if local_variable.variable_type == VoiceLocalVariableType.VOICE_NAME:
-                if_condition = (local_variable.name, None, local_variable.value)
+                if isinstance(local_variable.value, dict) and len(local_variable.value) == 1:
+                    right_value = list(local_variable.value.values())[0]
+                else:
+                    right_value = local_variable.value
+                if_condition = (local_variable.name, None, right_value)
                 found_flag = True
                 break
             elif local_variable.variable_type == VoiceLocalVariableType.VOICE_RETURN_CONTENT:
@@ -1464,7 +1469,97 @@ class VoiceEvaluator(ProgramEvaluator):
             "Speech": Speech,
             "search_voice_library": search_voice_library
         }
+    def store(self, file_path: str):
+        """Save test cases to disk. Handles Speech objects by converting them to JSON."""
         
+        def speech_to_json(obj):
+            """Recursively convert Speech objects to JSON format."""
+            if isinstance(obj, Speech):
+                return obj.to_json()
+            elif isinstance(obj, dict):
+                return {k: speech_to_json(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [speech_to_json(item) for item in obj]
+            return obj
+
+        # Convert test cases to serializable format
+        serializable_test_cases = []
+        for test_case in self.test_cases:
+            serializable_case = {
+                "result": speech_to_json(test_case["result"]),
+                "state_oracle": test_case["state_oracle"],
+                "program_info": {
+                    "init_local_str": test_case["program_info"]["init_local_str"],
+                    "init_local_info": test_case["program_info"]["init_local_info"],
+                    "init_implicit_dict": test_case["program_info"]["init_implicit_dict"],
+                    "end_implict_list": test_case["program_info"]["end_implict_list"],
+                    "init_load_str": test_case["program_info"]["init_load_str"],
+                    "init_load_info": speech_to_json(test_case["program_info"]["init_load_info"])
+                },
+                "program": test_case["program"]
+            }
+            serializable_test_cases.append(serializable_case)
+
+        # Save to file
+        saved_info = {
+            "test_cases": serializable_test_cases,
+            "config": self.config
+        }
+        with open(file_path, 'w') as f:
+            json.dump(saved_info, f, indent=2)
+    
+    @classmethod
+    def load(cls, file_path: str, config: Dict[str, Any] = None):
+        """Load test cases from disk. Converts JSON back to Speech objects."""
+        
+        def json_to_speech(obj):
+            """Recursively convert JSON format back to Speech objects."""
+            if isinstance(obj, dict):
+                if "is_speech" in obj and obj["is_speech"]:
+                    return Speech.from_json(obj)
+                else:
+                    return {k: json_to_speech(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [json_to_speech(item) for item in obj]
+            return obj
+
+        # Load from file
+        with open(file_path, 'r') as f:
+            saved_info = json.load(f)
+        
+        if config is None:
+            config = saved_info["config"]
+        
+        created_cls = cls(config)
+        test_cases = saved_info["test_cases"]
+        
+        # Convert test cases back to proper format
+        for test_case in test_cases:
+            # Handle init_load_info conversion
+            init_load_info = test_case["program_info"]["init_load_info"]
+            if init_load_info is not None:
+                converted_init_load_info = []
+                for (name, value) in init_load_info:
+                    converted_init_load_info.append((name, json_to_speech(value)))
+                init_load_info = converted_init_load_info
+            
+            converted_case = {
+                "result": json_to_speech(test_case["result"]),
+                "state_oracle": test_case["state_oracle"],
+                "program_info": {
+                    "init_local_str": test_case["program_info"]["init_local_str"],
+                    "init_local_info": test_case["program_info"]["init_local_info"],
+                    "init_implicit_dict": test_case["program_info"]["init_implicit_dict"],
+                    "end_implict_list": test_case["program_info"]["end_implict_list"],
+                    "init_load_str": test_case["program_info"]["init_load_str"],
+                    "init_load_info": init_load_info
+                },
+                "program": test_case["program"]
+            }
+            created_cls.test_cases.append(converted_case)
+
+        return created_cls
+    
     def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
         # 
         voice_lab.voice_library.reset()
@@ -1498,9 +1593,16 @@ class VoiceEvaluator(ProgramEvaluator):
         if isinstance(result, Speech):
             result = result.to_json()
         
+        if isinstance(result, Tuple):
+            result = list(result)
+            for idx in range(len(result)):
+                if isinstance(result[idx], Speech):
+                    result[idx] = result[idx].to_json()
+        
+        state_oracle = voice_lab.call_recorder.get_outbound_call_info()
         test_case = {
             "result": result,
-            "state_oracle": None,
+            "state_oracle": state_oracle,
             "program_info": program_info,
             "program": program
         }
@@ -1508,9 +1610,200 @@ class VoiceEvaluator(ProgramEvaluator):
         return test_case
             
     def evaluate(self, program: str):
-        pass
-    
-     
+        pass_list = []
+        test_case_pass_detail = []
+        for test_idx, test_case in enumerate(self.test_cases):
+            self.prepare_environment(test_case["program_info"]["init_implicit_dict"], test_case["program_info"]["init_local_info"])
+            namespace = {}
+            complete_program = test_case["program_info"]["init_local_str"] + program
+            init_load_info = test_case["program_info"]["init_load_info"]
+            if init_load_info is not None:
+                for (name, value) in init_load_info:
+                    namespace[name] = copy.deepcopy(value)
+                    
+            for (name, value) in self.preload_info.items():
+                namespace[name] = value
+            
+            try:
+                exec(complete_program, namespace)
+            except Exception as e:
+                error_info = traceback.format_exc()
+                pass_list.append(False)
+                test_case_pass_detail.append({
+                    "result_pass": False,
+                    "error_info": error_info,
+                    "state_pass": None,
+                    "state_pass_detail": None
+                })
+                continue
+            state_info = voice_lab.call_recorder.get_outbound_call_info()
+            # ====== Evaluate variable oracle ======
+            if f"{RESULT_NAME}" in namespace:
+                result = namespace[RESULT_NAME]
+                gt_result = test_case["result"]
+                if gt_result is None:
+                    if result is not None:
+                        pass_list.append(False)
+                        test_case_pass_detail.append({
+                            "result_pass": False,
+                            "error_info": None,
+                            "state_pass": None,
+                            "state_pass_detail": "There should be no return result"
+                        })
+                        continue
+                if isinstance(test_case["result"], list):
+                    gt_oracle_list = [0] * len(test_case["result"])
+                    if len(test_case["result"]) != len(result):
+                        pass_list.append(False)
+                        test_case_pass_detail.append({
+                            "result_pass": False,
+                            "error_info": None,
+                            "state_pass": None,
+                            "state_pass_detail": "Return result length mismatch"
+                        })
+                        continue
+                    else:
+                        # The order of result and gt_result is not guaranteed.
+                        fail = False
+                        has_corresponding = False
+                        for item in result:
+                            left = item
+                            left_is_speech = False
+                            if isinstance(item, dict):
+                                if "is_speech" in item and item["is_speech"]:
+                                    left = Speech.from_json(item)
+                                    left_is_speech = True
+                            if isinstance(left, Speech):
+                                left_is_speech = True
+                            for gt_idx, gt_item in enumerate(gt_result):
+                                if gt_oracle_list[gt_idx] == 1:
+                                    continue
+                                right = gt_item
+                                if isinstance(right, dict) and "is_speech" in right and right["is_speech"]:
+                                    if not left_is_speech:
+                                        continue
+                                    right = Speech.from_json(right)
+                                if left == right:
+                                    has_corresponding = True
+                                    gt_oracle_list[gt_idx] = 1
+                                    break
+                            if not has_corresponding:
+                                pass_list.append(False)
+                                test_case_pass_detail.append({
+                                    "result_pass": False,
+                                    "error_info": None,
+                                    "state_pass": None,
+                                    "state_pass_detail": ["Return result mismatch: No corresponding result", gt_result, result]
+                                })
+                                fail = True
+                                break
+                    if fail:
+                        continue
+                    if not all(x == 1 for x in gt_oracle_list):
+                        pass_list.append(False)
+                        test_case_pass_detail.append({
+                            "result_pass": False,
+                            "error_info": None,
+                            "state_pass": None,
+                            "state_pass_detail": ["Return result mismatch", gt_result, result]
+                        })
+                        continue
+                else:
+                    # Result is not List
+                    right = test_case["result"]
+                    if isinstance(right, dict) and "is_speech" in right and right["is_speech"]:
+                        right = Speech.from_json(right)
+                    if result != right:
+                        pass_list.append(False)
+                        test_case_pass_detail.append({
+                            "result_pass": False,
+                            "error_info": None,
+                            "state_pass": None,
+                            "state_pass_detail": ["Return result mismatch", gt_result, result]
+                        })
+                        continue
+            else:
+                if test_case["result"] is not None:
+                    pass_list.append(False)
+                    test_case_pass_detail.append({
+                        "result_pass": False,
+                        "error_info": None,
+                        "state_pass": None,
+                        "state_pass_detail": "Return result not found"
+                    })
+                    continue
+            # ====== Evaluate state oracle ======
+            if state_info is not None:
+                if test_case["state_oracle"] is None:
+                    test_case_pass_detail.append({
+                        "result_pass": True,
+                        "error_info": None,
+                        "state_pass": False,
+                        "state_pass_detail": "No call should be made"
+                    })
+                if len(state_info) != len(test_case["state_oracle"]):
+                    test_case_pass_detail.append({
+                        "result_pass": True,
+                        "error_info": None,
+                        "state_pass": False,
+                        "state_pass_detail": "Call length mismatch"
+                    })
+                    pass_list.append(False)
+                    continue
+                state_oracle_list = [0] * len(test_case["state_oracle"])
+                fail = False
+                for state_item in state_info:
+                    has_corresponding = False
+                    for state_oracle_idx, state_oracle_item in enumerate(test_case["state_oracle"]):
+                        if state_oracle_list[state_oracle_idx] == 1:
+                            # Already matched
+                            continue
+                        if voice_lab.call_recorder.compare_outbound_info(state_item, state_oracle_item):
+                            state_oracle_list[state_oracle_idx] = 1
+                            has_corresponding = True
+                            break
+                    if not has_corresponding:
+                        test_case_pass_detail.append({
+                            "result_pass": True,
+                            "error_info": None,
+                            "state_pass": False,
+                            "state_pass_detail": "Call mismatch: more calls than expected"
+                        })
+                        pass_list.append(False)
+                        fail = True
+                        break
+                if fail:
+                    continue
+                if not all(x == 1 for x in state_oracle_list):
+                    test_case_pass_detail.append({
+                        "result_pass": True,
+                        "error_info": None,
+                        "state_pass": False,
+                        "state_pass_detail": "Call mismatch: less calls than expected"
+                    })
+                    pass_list.append(False)
+                    continue
+            else:
+                if test_case["state_oracle"] is not None:
+                    test_case_pass_detail.append({
+                        "result_pass": True,
+                        "error_info": None,
+                        "state_pass": False,
+                        "state_pass_detail": "Call missing"
+                    })
+                    pass_list.append(False)
+                    continue
+                
+                
+            test_case_pass_detail.append({
+                "result_pass": True,
+                "error_info": None,
+                "state_pass": True,
+                "state_pass_detail": None
+            })       
+            pass_list.append(True)
+        return pass_list, test_case_pass_detail
+        
 
 def test_search_voice_library():
     schema = VoiceVariableSchema()
