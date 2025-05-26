@@ -27,17 +27,19 @@ Program:
 {program}
 ```
 
-In your description, first define user variable/constant name (such as user_variable_0) in the init block with necessary descriptions of their types and structures (e.g., dict with what key), but do not directly show their values since they may change with respect to different test cases.
+In your description, first define user variable/constant name (such as user_variable_0) in the init block with necessary descriptions of their types and structures (e.g., dict with what key), 
+but do not directly show their values since they may change with respect to different test cases. The user-defined contents will be automatically loaded upon evaluation.
 Provide necessary instructions when these variable/constant names are referred to. ONLY refer to names, not values. 
 All user-provided content should be used (e.g., when the variable value matches user_constant_0) if they are referred in the program.
 If there is RESULT variable, specify it as its vaule will be checked using test cases.
 
-Note: The generated description will be used to evaluate LLMs' ability to understand natural language and generate correct stateful code.
-If you can make the description unambiguous, you should allow the LLM to infer implicit states rather than explicitly listing every detail.
+Note: The generated description will be used to evaluate LLMs’ ability to understand natural language and produce correct stateful code.
+Aim to make the description as unambiguous as possible. When appropriate, allow the LLM to infer implicit states instead of explicitly specifying every detail.
 
 Response Format:
 <User Variable Definition>
 user_variable_0 is a xxx, ...
+user_variable_1 is a preloaded content, ...
 <Task Instructions>
 Implement ...
 '''

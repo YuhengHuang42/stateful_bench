@@ -28,11 +28,19 @@ def main(
     api_key = config_dict["env"]["api_key"]
     task = config_dict["task"]
     max_iterations = config_dict["agent_config"]["max_iterations"]
-    assert task in ["session"]
+    assert task in ["session", "tensor", "voice"]
     if task == "session":
         from Sgenerator.session_state import SessionEvaluator, SESSION_SUMMARY_PROMPT
         trace_evaluator_class = SessionEvaluator
         summary_prompt = SESSION_SUMMARY_PROMPT
+    elif task == "tensor":
+        from Sgenerator.tensor_state import TensorEvaluator, TENSOR_SUMMARY_PROMPT
+        trace_evaluator_class = TensorEvaluator
+        summary_prompt = TENSOR_SUMMARY_PROMPT
+    elif task == "voice":
+        from Sgenerator.voice_state import VoiceEvaluator, VOICE_SUMMARY_PROMPT
+        trace_evaluator_class = VoiceEvaluator
+        summary_prompt = VOICE_SUMMARY_PROMPT
     
     trace_evaluator_book = {}
     for file in os.listdir(trace_save_path):
@@ -42,11 +50,12 @@ def main(
             idx = int(file.split('_')[1].split('.')[0])
             trace_evaluator_book[idx] = trace_evaluator
     
+    logger.info(f"Loaded {len(trace_evaluator_book)} trace evaluators.")
     program_info = []
     for idx in sorted(trace_evaluator_book.keys()):
         program_info.append({
             "init_block": trace_evaluator_book[idx].test_cases[0]["program_info"]["init_local_str"],
-            "init_load_info": trace_evaluator_book[idx].test_cases[0]["program_info"]["init_load_info"],
+            "init_load_str": trace_evaluator_book[idx].test_cases[0]["program_info"]["init_load_str"],
             "program": trace_evaluator_book[idx].test_cases[0]["program"]
         })
     

@@ -27,6 +27,19 @@ from Sgenerator.voice_lab import (
 INIT_VOICE = "user_voice"
 LOOP_VARIABLE = "voice_item"
 
+VOICE_SUMMARY_PROMPT = '''The below code is about a set of SpeechLab APIs that provide advanced speech and audio processing capabilities, 
+including voice search, text-to-speech, speech transformation, transcription, and telephony integration. 
+These APIs enable flexible manipulation and conversion of audio data for a variety of applications such as voice synthesis, voice conversion, and automated calling.
+
+API Functions:
+search_voice_library - Search for voices in the ElevenLabs voice library by name, category, or gender, returning matching voice details.
+text_to_speech - Convert text into speech audio using a specified or default voice, with options to control stability, similarity, and style of the generated voice.
+speech_to_speech - Transform audio from one voice to another, enabling voice conversion using provided audio and target voice.
+speech_to_text - Transcribe spoken audio into text, with optional speaker diarization to identify who is speaking.
+isolate_audio - Isolate and extract audio from a given input, returning the processed audio.
+make_outbound_call - Initiate an outbound phone call using a specified voice and audio via Twilio and ElevenLabs integration.
+'''
+
 class VoiceLocalVariableType(Enum):
     STATE = "state"
     VOICE_NAME = "voice_name"
@@ -1491,8 +1504,8 @@ class VoiceEvaluator(ProgramEvaluator):
                 "program_info": {
                     "init_local_str": test_case["program_info"]["init_local_str"],
                     "init_local_info": test_case["program_info"]["init_local_info"],
-                    "init_implicit_dict": test_case["program_info"]["init_implicit_dict"],
-                    "end_implict_list": test_case["program_info"]["end_implict_list"],
+                    "init_implicit_dict": None,
+                    "end_implict_list": None,
                     "init_load_str": test_case["program_info"]["init_load_str"],
                     "init_load_info": speech_to_json(test_case["program_info"]["init_load_info"])
                 },

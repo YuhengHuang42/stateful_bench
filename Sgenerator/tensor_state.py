@@ -23,8 +23,19 @@ MAX_KERNEL_SIZE = 7
 MAX_CHANNELS = 64
 FLOAT_THRESHOLD = 1e-2
 
-TENSOR_SUMMARY_PROMPT = '''
+TENSOR_SUMMARY_PROMPT = '''The below code is about a set of PyTorch tensor manipulation APIs that provide essential operations for deep learning and scientific computing. 
+These APIs enable efficient reshaping, transformation, and combination of multi-dimensional arrays (tensors), 
+which are fundamental for building and training neural networks.
+
+API Functions:
+conv2d - Applies a 2D convolution over input tensors, commonly used in image processing and convolutional neural networks (CNNs) to extract spatial features.
+permute - Returns a view of the input tensor with its dimensions reordered, useful for changing the arrangement of data without copying.
+split - Splits a tensor into multiple chunks along a specified dimension, either into equal parts or custom sizes, facilitating batch processing or data partitioning.
+cat - Concatenates a sequence of tensors along a given dimension, allowing for the merging of data from different sources or model outputs.
+linear - Applies a linear (fully connected) transformation to the input tensor, a core operation in neural network layers for feature transformation.
+transpose - Swaps two specified dimensions of a tensor, often used in matrix operations and for aligning data shapes.
 '''
+
 
 def normalize_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
     result = {}

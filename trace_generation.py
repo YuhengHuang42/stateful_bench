@@ -4,6 +4,7 @@ from pathlib import Path
 import yaml
 import pickle
 import os
+from loguru import logger
 
 from Sgenerator.state import generate_and_collect_test_case
 
@@ -33,6 +34,16 @@ def main(
         schema_class = SessionVariableSchema
         random_init_class = SessionRandomInitializer
         evaluator_class = SessionEvaluator
+    elif config_dict["task"] == "tensor":
+        from Sgenerator.tensor_state import TensorEvaluator, TensorRandomInitializer, TensorVariableSchema
+        schema_class = TensorVariableSchema
+        random_init_class = TensorRandomInitializer
+        evaluator_class = TensorEvaluator
+    elif config_dict["task"] == "voice":
+        from Sgenerator.voice_state import VoiceEvaluator, VoiceRandomInitializer, VoiceVariableSchema
+        schema_class = VoiceVariableSchema
+        random_init_class = VoiceRandomInitializer
+        evaluator_class = VoiceEvaluator
     else:
         raise ValueError(f"Task {config_dict['task']} is not supported.")
         
@@ -40,6 +51,9 @@ def main(
     evaluator_book = {}
     occ_book_diff_recorder = {}
     idx = 0
+    enable_coverage = generation_config["enable_coverage"] if "enable_coverage" in generation_config else True
+    if enable_coverage == False:
+        logger.info("Coverage-guided trace generation is disabled.")
     while idx < num_of_tests:
         evaluator, is_success, new_occurence_book, occ_diff = generate_and_collect_test_case(
             schema_class = schema_class,
@@ -49,7 +63,8 @@ def main(
             evaluation_config = evaluation_config,
             num_of_apis = num_of_apis,
             control_position_candidate = control_position_candidate,
-            occurence_book=occurence_book
+            occurence_book=occurence_book,
+            enable_coverage=enable_coverage
         )
         if is_success:
             occurence_book = new_occurence_book
