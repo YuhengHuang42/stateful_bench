@@ -278,6 +278,13 @@ class Schema:
             init_program += f"{init_str[0]} = {init_str[1]}\n"
             returned_init_local_info.append((init_str[0], init_str[1]))
         return init_program, returned_init_local_info
+    
+    def count_api_call(self, transition_name: str):
+        """
+        Wehtehr the given transition is actually an API Call
+        LocalEdit in Session service is not an API call
+        """
+        return True
 
 @dataclass
 class LocalVariable:
@@ -371,7 +378,8 @@ class TraceGenerator:
         previous_transition_info = None
         trace = []
         trace_str = []
-        for i in range(call_num):
+        i = 0
+        while i < call_num:
             enter_postprocess_stage, postprocess_transitions = self.state_schema.postprocess_transitions(call_num - i)
             if enter_postprocess_stage and not disable_postprocess:
                 for idx, transition in enumerate(postprocess_transitions):
@@ -531,6 +539,8 @@ class TraceGenerator:
                 trace.append([selected[0], copy.deepcopy(target_transition_info["required_parameters"])])
                 trace_str.append(new_transition.get_program_str())
                 previous_transition_info = (selected[0], target_transition_info["required_parameters"]) # (Transition, parameters)
+                if self.state_schema.count_api_call(selected[0]):
+                    i += 1
         return (trace, trace_str), this_trace_duplicate_local_variable_map, True
 
 

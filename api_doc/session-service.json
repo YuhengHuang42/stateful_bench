@@ -219,66 +219,6 @@
         }
       },
       "/api/sessions/{source}/{type}/{id}": {
-        "get": {
-          "tags": [
-            "session-service-controller"
-          ],
-          "summary": "getSession",
-          "operationId": "getSessionUsingGET",
-          "produces": [
-            "*/*"
-          ],
-          "parameters": [
-            {
-              "name": "source",
-              "in": "path",
-              "description": "source",
-              "required": true,
-              "type": "string"
-            },
-            {
-              "name": "type",
-              "in": "path",
-              "description": "type",
-              "required": true,
-              "type": "string",
-              "enum": [
-                "main_session",
-                "virtual_study",
-                "group",
-                "comparison_session",
-                "settings",
-                "custom_data",
-                "genomic_chart",
-                "custom_gene_list"
-              ]
-            },
-            {
-              "name": "id",
-              "in": "path",
-              "description": "id",
-              "required": true,
-              "type": "string"
-            }
-          ],
-          "responses": {
-            "200": {
-              "description": "OK",
-              "schema": {
-                "$ref": "#/definitions/Session"
-              }
-            },
-            "401": {
-              "description": "Unauthorized"
-            },
-            "403": {
-              "description": "Forbidden"
-            },
-            "404": {
-              "description": "Not Found"
-            }
-          }
-        },
         "put": {
           "tags": [
             "session-service-controller"

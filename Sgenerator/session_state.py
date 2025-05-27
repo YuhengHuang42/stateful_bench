@@ -962,6 +962,15 @@ class SessionVariableSchema(Schema):
                 value_name, already_exist = self.add_local_constant(value)
             new_transition.string_parameters = {"field": filed_name, "value": value_name}
         return new_transition
+
+    def count_api_call(self, transition_name: str):
+        """
+        Whether the given transition is actually an API Call
+        LocalEdit in Session service is not an API call
+        """
+        if transition_name == "LocalEdit":
+            return False
+        return True
     
 class GetSessions(Transition):
     """
@@ -1882,7 +1891,7 @@ class SessionEvaluator(ProgramEvaluator):
                     oracle[source_type] = []
                 oracle[source_type].append(session)
         
-        if result is not None and "id" in result:
+        if result is not None and isinstance(result, dict) and "id" in result:
             result.pop("id")
         test_case = {
             "result": result,
@@ -1917,26 +1926,37 @@ class SessionEvaluator(ProgramEvaluator):
                 })
                 continue
             # ====== Evaluate variable oracle ======
-            if f"{RESULT_NAME}" in namespace:
-                result = namespace[RESULT_NAME]
-                if result is not None and "id" in result:
-                    result.pop("id")
-                if isinstance(result, float) or isinstance(result, int):
-                    if abs(result - test_case["result"]) > threshold:
+            try:
+                if f"{RESULT_NAME}" in namespace:
+                    result = namespace[RESULT_NAME]
+                    if result is not None and "id" in result:
+                        result.pop("id")
+                    if isinstance(result, float) or isinstance(result, int):
+                        if abs(result - test_case["result"]) > threshold:
+                            result_pass = False
+                    elif isinstance(result, dict):
+                        for key in result:
+                            if isinstance(result[key], float) or isinstance(result[key], int):
+                                if abs(result[key] - test_case["result"][key]) > threshold:
+                                    result_pass = False
+                            else:
+                                if result[key] != test_case["result"][key]:
+                                    result_pass = False
+                    elif result != test_case["result"]:
                         result_pass = False
-                elif isinstance(result, dict):
-                    for key in result:
-                        if isinstance(result[key], float) or isinstance(result[key], int):
-                            if abs(result[key] - test_case["result"][key]) > threshold:
-                                result_pass = False
-                        else:
-                            if result[key] != test_case["result"][key]:
-                                result_pass = False
-                elif result != test_case["result"]:
-                    result_pass = False
-            else:
-                if test_case["result"] is not None:
-                    result_pass = False
+                else:
+                    if test_case["result"] is not None:
+                        result_pass = False
+            except Exception as e:
+                error_info = traceback.format_exc()
+                pass_list.append(False)
+                test_case_pass_detail.append({
+                    "result_pass": False,
+                    "error_info": error_info,
+                    "state_pass": None,
+                    "state_pass_detail": None
+                })
+                continue
             # ====== Evaluate state oracle ======
             state_pass = True
             state_pass_detail = {}
