@@ -25,7 +25,7 @@ def main(
     if agent_save_path is None:
         agent_save_path = config_dict["env"]["agent_save_path"]
         
-    api_key = config_dict["env"]["api_key"]
+    api_key = config_dict["env"]["openai_api_key"]
     task = config_dict["task"]
     max_iterations = config_dict["agent_config"]["max_iterations"]
     assert task in ["session", "tensor", "voice"]

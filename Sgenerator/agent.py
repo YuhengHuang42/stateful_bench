@@ -4,7 +4,7 @@ import json
 from loguru import logger
 
 
-from Sgenerator.utils import write_jsonl
+from Sgenerator.utils import write_jsonl, generate_jsonl_for_openai, submit_batch_request_openai
 GENERATOR_PROMPT = '''You are given a block of sequential API calls produced by a fuzzing engine, along with an optional initialization block. Your task is to translate these API calls into precise natural language descriptions that could be used as programming instructions for a developer.
 
 Requirements:
@@ -33,7 +33,7 @@ Provide necessary instructions when these variable/constant names are referred t
 All user-provided content should be used (e.g., when the variable value matches user_constant_0) if they are referred in the program.
 If there is RESULT variable, specify it as its vaule will be checked using test cases.
 
-Note: The generated description will be used to evaluate LLMs’ ability to understand natural language and produce correct stateful code.
+Note: The generated description will be used to evaluate LLMs' ability to understand natural language and produce correct stateful code.
 Aim to make the description as unambiguous as possible. When appropriate, allow the LLM to infer implicit states instead of explicitly specifying every detail.
 
 Response Format:
@@ -95,77 +95,6 @@ class AgentStatus(Enum):
     CONTINUE = 1
     END = 2
 
-# ===== OPENAI API Related Functions=====
-def generate_jsonl_for_openai(request_id_list, 
-                              message_list, 
-                              output_path,
-                              max_tokens=None, 
-                              model_type="gpt-4.1", 
-                              url="/v1/chat/completions"):
-    """
-    Prepare input batch data for OPENAI API
-    Args:
-        request_id_list: used to index the message_list.
-        message_list: list of messages to be sent to the API
-        output_path: output file path
-        max_tokens: maximum tokens to generate
-        model_type: model type of OPENAI API
-        url: API endpoint
-    """
-    assert len(request_id_list) == len(message_list)
-    data = []
-    requestid_to_message = dict(zip(request_id_list, message_list))
-    for idx, item in enumerate(request_id_list):
-        request_id = item
-        message = message_list[idx]
-        body = {"model": model_type, 
-         "messages": message
-        }
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
-        per_request = {
-            "custom_id": request_id,
-            "method": "POST",
-            "url": url,
-            "body": body
-        }
-        data.append(per_request)
-    
-    write_jsonl(output_path, data)
-    
-    return data, requestid_to_message
-
-def submit_batch_request_openai(client, 
-                                input_file_path, 
-                                url="/v1/chat/completions", 
-                                completion_window="24h", 
-                                description="code analysis"):
-    """
-    Submit the batch task to OPENAI API
-    Args:
-        client: OPENAI API client (client = openai.OpenAI(api_key=api_key))
-        input_file_path: input file path
-        url: API endpoint
-        completion_window: completion window
-        description: description of the submitted task
-    """
-    batch_input_file = client.files.create(
-        file=open(input_file_path, "rb"),
-        purpose="batch"
-    )
-    batch_input_file_id = batch_input_file.id
-    batch_submit_info = client.batches.create(
-        input_file_id=batch_input_file_id,
-        endpoint=url,
-        completion_window=completion_window,
-        metadata={
-        "description": description
-        }
-    )
-    batch_submit_info_id = batch_submit_info.id
-    batch_result_info = client.batches.retrieve(batch_submit_info_id)
-    
-    return (batch_submit_info, batch_result_info)
 
 class Generator():
     def __init__(self, application_description,
@@ -541,6 +470,56 @@ class MultiAgent():
             }
         return saved_data
 
+
+LLM_PROGRAM_GENERATION_PROMPT = '''Program Generation from API Documentation:
+Given the following API documentation, generate a program that uses these APIs. The program should adhere to the following constraints:
+1. Number of API Calls:
+    - The execution trace of the program must contain exactly 5 API calls from start to finish, regardless of any branching logic.
+2. Program Structure:
+    - The program should start with an initialization block (e.g., variable setup, object creation, etc.).
+    - After initialization, the main script should execute the API calls.
+3. Branching Logic:
+    - The program may or may not include an if-else branch.
+    - If an if-else branch is present, ensure that both the 'if' and 'else' branches result in exactly 5 API calls in their respective execution traces (including any calls before the branch, if applicable).
+4. Fuzzing-Like Diversity:
+    - The generated programs should be diverse, exploring different combinations and orders of API calls, as in fuzz testing.
+    - You may use random or varied input values for API calls to increase diversity.
+    
+API Documentation: {api_doc}
+
+Output Format:
+Output only the code for the generated program enclosed in ``` ``` tags.
+Do not include explanations or comments unless specified.
+Example:
+```
+{example_program}
+```
+
+Split the generation of each program through ``` ``` tags. Please generate {num_programs} programs in sequential order.
+'''
+
+SESSION_EXAMPLE = '''
+User_variable_0 = {'id': None, 'source': 'user_portal', 'type': 'custom_gene_list', 'checksum': '', 'data': {'title': 'Ovarian Cancer Analysis', 'members': 'josephleblanc@example.com', 'similarities': '17'}}
+user_constant_2 = "17"
+
+if User_variable_0["data"]["similarities"] == user_constant_2:
+    source = User_variable_0['source']
+    type = User_variable_0['type']
+    url = f'{BASE_URL}/api/sessions/{source}/{type}'
+    response_4 = requests.get(url)
+'''
+
+TENSOR_EXAMPLE = '''
+user_constant_0 = "torch.float32"
+
+response_1 = torch.nn.functional.conv2d(user_tensor_0, user_tensor_0, stride=4, padding=0, dilation=1)
+response_2 = torch.cat((response_1, response_1), 0) # Output shape: torch.Size([82, 41, 1, 1])
+'''
+
+VOICE_EXAMPLE = '''
+user_variable_0 = "True once camera while beat voice."
+response_1 = text_to_speech(text=user_variable_0, style=0.65)
+'''
 
 # ===== Test =====
 # Test Generator class

@@ -30,6 +30,15 @@ For your descrptions, directly use {BASE_URL} to refer to the Query URL. It will
 Please be careful when describing "updates" (it is ambiguous whether it is local variable updates or remote updates through APIs).
 '''
 
+SESSION_GENERATION_PROMPT = '''All APIs, request library, user-related variables, and constants have been preloaded into memory and are available for direct use.
+Please use {BASE_URL} to refer to the Query URL, it will be automatically replaced at evaluation time.
+Please begin your Python code generation with a code block (with ``), for example:
+```
+response_4 = requests.get(url)
+```
+Your code:
+'''
+
 class SessionType(str, Enum):
     MAIN_SESSION = "main_session"
     VIRTUAL_STUDY = "virtual_study"
@@ -219,7 +228,7 @@ class SessionVariableSchema(Schema):
             GetSessions,
             AddSession,
             GetSessionByQuery,
-            GetSession,
+            GetSession, # not Used
             UpdateSession,
             DeleteSession,
             LocalEdit,

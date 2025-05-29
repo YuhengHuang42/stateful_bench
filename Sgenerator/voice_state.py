@@ -40,6 +40,14 @@ isolate_audio - Isolate and extract audio from a given input, returning the proc
 make_outbound_call - Initiate an outbound phone call using a specified voice and audio via Twilio and ElevenLabs integration.
 '''
 
+VOICE_GENERATION_PROMPT = '''All APIs, user-related variables, and constants have been preloaded into memory and are available for direct use.
+Please begin your Python code generation with a code block (with ``), for example:
+```
+response_1 = text_to_speech(text=user_variable)
+```
+Your code:
+'''
+
 class VoiceLocalVariableType(Enum):
     STATE = "state"
     VOICE_NAME = "voice_name"

@@ -12,7 +12,6 @@ import requests
 import json
 import traceback
 import torch
-import numpy as np
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
@@ -36,6 +35,13 @@ linear - Applies a linear (fully connected) transformation to the input tensor, 
 transpose - Swaps two specified dimensions of a tensor, often used in matrix operations and for aligning data shapes.
 '''
 
+TENSOR_GENERATION_PROMPT = '''All APIs, Pytorch library, user-related variables, and constants have been preloaded into memory and are available for direct use.
+Please begin your Python code generation with a code block (with ``), for example:
+```
+response_1 = torch.cat((user_variable, user_variable), 0)
+```
+Your code:
+'''
 
 def normalize_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
@@ -63,7 +69,7 @@ class TensorRandomInitializer(RandomInitializer):
         dim1 = random.randint(lower, upper)
         dim2 = random.randint(lower, upper)
         
-        dim3 = random.randint(lower // 2, upper // 2) * 2  # Generate even number between 2 and 64
+        dim3 = random.randint(max(lower // 2, 1), max(upper // 2, 2)) * 2  # Generate even number between 2 and 64
         dim4 = dim3  # Third and fourth dimensions are equal
         
         # Create tensor with random values using torch.randn
@@ -1543,29 +1549,40 @@ class TensorEvaluator(ProgramEvaluator):
                     "state_pass_detail": None,
                 })
                 continue
-            result_pass = True
-            if f"{RESULT_NAME}" in namespace:
-                result = namespace[RESULT_NAME]
-                if isinstance(result, torch.Tensor):
-                    if isinstance(test_case["result"], float) or isinstance(test_case["result"], int):
-                        if result.numel() != 1:
+            try:
+                result_pass = True
+                if f"{RESULT_NAME}" in namespace:
+                    result = namespace[RESULT_NAME]
+                    if isinstance(result, torch.Tensor):
+                        if isinstance(test_case["result"], float) or isinstance(test_case["result"], int):
+                            if result.numel() != 1:
+                                result_pass = False
+                            result = result.item()
+                            if abs(result - test_case["result"]) > FLOAT_THRESHOLD:
+                                result_pass = False
+                        elif result.shape != test_case["result"].shape:
                             result_pass = False
-                        result = result.item()
+                        elif not torch.allclose(result, test_case["result"], rtol=FLOAT_THRESHOLD, atol=FLOAT_THRESHOLD):
+                            result_pass = False
+                    elif isinstance(result, (float, int)):
                         if abs(result - test_case["result"]) > FLOAT_THRESHOLD:
                             result_pass = False
-                    elif result.shape != test_case["result"].shape:
-                        result_pass = False
-                    elif not torch.allclose(result, test_case["result"], rtol=FLOAT_THRESHOLD, atol=FLOAT_THRESHOLD):
-                        result_pass = False
-                elif isinstance(result, (float, int)):
-                    if abs(result - test_case["result"]) > FLOAT_THRESHOLD:
-                        result_pass = False
+                    else:
+                        if result != test_case["result"]:
+                            result_pass = False
                 else:
-                    if result != test_case["result"]:
+                    if test_case["result"] is not None:
                         result_pass = False
-            else:
-                if test_case["result"] is not None:
-                    result_pass = False
+            except Exception as e:
+                error_info = traceback.format_exc()
+                pass_list.append(False)
+                test_case_pass_detail.append({
+                    "result_pass": False,
+                    "error_info": error_info,
+                    "state_pass": None,
+                    "state_pass_detail": None
+                })
+                continue
             pass_list.append(result_pass)
             test_case_pass_detail.append({
                 "result_pass": result_pass,

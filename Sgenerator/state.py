@@ -5,6 +5,8 @@ import random
 import numpy as np
 from loguru import logger
 import copy
+import os
+import json
 from . import utils
 USER_FUNCTION_PARAM_FLAG = "user_variable"
 USER_CONSTANT_FLAG = "user_constant"
@@ -875,3 +877,83 @@ def generate_and_collect_test_case(
             logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip this test case.")
         
     return evaluator, is_success, occurence_book, added_changes
+
+
+LLM_EVAL_PROMPT = '''You are provided with API documentation and task-specific instructions. Based on this information, generate the corresponding code to fulfill the task requirements.'''
+
+class StateEval():
+    def __init__(self, parent_path: str, task: str, config_dict: dict, api_doc: str):
+        self.parent_path = parent_path
+        self.task = task
+        self.config_dict = config_dict
+        self.doc = api_doc
+        
+        assert self.task in ["session", "tensor", "voice"]
+        evaluation_config = {}
+        task_specific_prompt = None
+        if self.task == "session":
+            from Sgenerator.session_state import SessionEvaluator, SESSION_GENERATION_PROMPT
+            evaluator_class = SessionEvaluator
+            task_specific_prompt = SESSION_GENERATION_PROMPT
+            evaluation_config["base_url"] = config_dict["env"]["base_url"]
+        elif self.task == "tensor":
+            from Sgenerator.tensor_state import TensorEvaluator, TENSOR_GENERATION_PROMPT
+            evaluator_class = TensorEvaluator
+            task_specific_prompt = TENSOR_GENERATION_PROMPT
+        elif self.task == "voice":
+            from Sgenerator.voice_state import VoiceEvaluator, VOICE_GENERATION_PROMPT
+            evaluator_class = VoiceEvaluator
+            task_specific_prompt = VOICE_GENERATION_PROMPT
+        else:
+            raise ValueError(f"Invalid task: {self.task}")
+        self.evaluator_class = evaluator_class
+        
+        self.evaluator_book = dict()
+        self.prompt_book = dict()
+        for file in os.listdir(self.parent_path): # Load Evaluators
+            if file.endswith(".json"):
+                idx = int(file.split('_')[1].split('.')[0])
+                self.evaluator_book[idx] = self.evaluator_class.load(os.path.join(self.parent_path, file), evaluation_config)
+        
+        with open(os.path.join(self.parent_path, "agent_data", "agent_data.json"), "r") as f:
+            agent_data = json.load(f)
+            for info_idx in (agent_data):
+                info = agent_data[info_idx]
+                prompt = self.get_prompt(info)
+                if prompt is None:
+                    logger.warning(f"Generation for idx: {info_idx} failed")
+                else:
+                    self.prompt_book[info_idx] = LLM_EVAL_PROMPT + "\n\n===The documentation===:\n" f"{self.doc}" + \
+                        "\n\n===The instructions===:\n" + prompt + "\n\n" + task_specific_prompt
+                
+        #self.evaluator_book = list(self.evaluator_book.values())
+        #self.prompt_book = list(self.prompt_book.values())
+        self.index_list = list(self.evaluator_book.keys())
+
+    
+    @staticmethod
+    def get_prompt(agent_conv: dict):
+        if "OK" in agent_conv['evaluator_messages'][-1]['content']:
+            prompt = agent_conv['generator_messages'][-1]['content']
+            return prompt
+        else:
+            return None
+    
+    def __getitem__(self, idx: int):
+        real_idx = self.index_list[idx]
+        return self.prompt_book[str(real_idx)]
+    
+    def __len__(self):
+        return len(self.index_list)
+    
+    def evaluate(self, idx: int, program: str):
+        real_idx = self.index_list[idx]
+        evaluator = self.evaluator_book[real_idx]
+        result = evaluator.evaluate(program)
+        return result
+    
+    def get_reference_code(self, idx: int):
+        real_idx = self.index_list[idx]
+        evaluator = self.evaluator_book[real_idx]
+        gt = evaluator.test_cases[0]["program"]
+        return gt
