@@ -1587,7 +1587,7 @@ class TensorEvaluator(ProgramEvaluator):
             test_case_pass_detail.append({
                 "result_pass": result_pass,
                 "error_info": None,
-                "state_pass": None,
+                "state_pass": True,
                 "state_pass_detail": None
             })
         return pass_list, test_case_pass_detail

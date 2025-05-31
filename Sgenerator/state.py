@@ -882,11 +882,15 @@ def generate_and_collect_test_case(
 LLM_EVAL_PROMPT = '''You are provided with API documentation and task-specific instructions. Based on this information, generate the corresponding code to fulfill the task requirements.'''
 
 class StateEval():
-    def __init__(self, parent_path: str, task: str, config_dict: dict, api_doc: str):
+    def __init__(self, parent_path: str, task: str, config_dict: dict, api_doc: str, agent_path: str=None):
         self.parent_path = parent_path
         self.task = task
         self.config_dict = config_dict
         self.doc = api_doc
+        if agent_path is not None:
+            self.agent_path = agent_path
+        else:
+            self.agent_path = os.path.join(self.parent_path, "agent_data", "agent_data.json")
         
         assert self.task in ["session", "tensor", "voice"]
         evaluation_config = {}
@@ -915,7 +919,7 @@ class StateEval():
                 idx = int(file.split('_')[1].split('.')[0])
                 self.evaluator_book[idx] = self.evaluator_class.load(os.path.join(self.parent_path, file), evaluation_config)
         
-        with open(os.path.join(self.parent_path, "agent_data", "agent_data.json"), "r") as f:
+        with open(self.agent_path, "r") as f:
             agent_data = json.load(f)
             for info_idx in (agent_data):
                 info = agent_data[info_idx]

@@ -218,7 +218,7 @@ def speech_to_speech(input_speech: Speech, voice_name: str) -> Speech:
     """Mock implementation of speech to speech conversion"""
     # Return new speech object with modified audio data
     global voice_library
-    assert voice_name in voice_library.voices, "Voice name not found in voice library"
+    assert voice_name in voice_library.voices, f"Voice name {voice_name} not found in voice library"
     new_item = copy.deepcopy(input_speech)
     new_item.voice_name = voice_name
     new_item.transitions.append(["speech_to_speech", {"voice_name": voice_name}])
@@ -244,7 +244,7 @@ def make_outbound_call(input_speech: Speech, voice_name: Optional[str] = None) -
     # Always return success in mock implementation
     global call_recorder
     call_recorder.add_outbound_call(input_speech, voice_name)
-    assert voice_name in voice_library.voices, "Voice name not found in voice library"
+    assert voice_name in voice_library.voices, f"Voice name {voice_name} not found in voice library"
     return True
 
 
