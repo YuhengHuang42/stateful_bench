@@ -32,7 +32,7 @@ Please be careful when describing "updates" (it is ambiguous whether it is local
 
 SESSION_GENERATION_PROMPT = '''All APIs, request library, user-related variables, and constants have been preloaded into memory and are available for direct use.
 Please use {BASE_URL} to refer to the Query URL, it will be automatically replaced at evaluation time.
-Please begin your Python code generation with a code block (with ``), for example:
+Please begin your Python code generation with a code block (with ```), for example:
 ```
 response_4 = requests.get(url)
 ```

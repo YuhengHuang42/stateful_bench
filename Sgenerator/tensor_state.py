@@ -36,7 +36,7 @@ transpose - Swaps two specified dimensions of a tensor, often used in matrix ope
 '''
 
 TENSOR_GENERATION_PROMPT = '''All APIs, Pytorch library, user-related variables, and constants have been preloaded into memory and are available for direct use.
-Please begin your Python code generation with a code block (with ``), for example:
+Please begin your Python code generation with a code block (with ```), for example:
 ```
 response_1 = torch.cat((user_variable, user_variable), 0)
 ```
