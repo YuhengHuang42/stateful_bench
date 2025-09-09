@@ -237,11 +237,23 @@ class Schema:
         If value is a quoted string (e.g., '"foo"'), change the content inside the quotes.
         Otherwise, append '_diff'.
         """
+        def reverse_datatype(value):
+            if value == "torch.float32":
+                return "torch.int", 1
+            elif value == "torch.int":
+                return "torch.float32", 1
+            else:
+                return value, 0
         if isinstance(value, str):
+            value, reverse_flag = reverse_datatype(value)
+            if reverse_flag:
+                return value
             if (len(value) >= 2) and (value[0] == value[-1]) and value[0] in ('"', "'"):
                 # Quoted string
                 inner = value[1:-1]
-                # You can make the modification more robust (e.g., add a suffix, or flip a char)
+                inner, reverse_flag = reverse_datatype(inner)
+                if reverse_flag:
+                    return value[0] + inner + value[-1]
                 new_inner = inner + "_diff"
                 return value[0] + new_inner + value[-1]
             else:
