@@ -1,0 +1,21 @@
+task: "voice"
+env:
+  trace_save_path: "/data/stateful_bench/voice"
+  agent_save_path: "/data/stateful_bench/voice/agent_data"
+  openai_api_key: ""
+  open_source_api_key: ""
+  open_source_base_url: ""
+  google_api_key: ""
+
+generation_config:
+  num_of_tests: 60
+  num_of_apis: 5
+  control_position_candidate: [1, 2, 3, 4] # When idx == 4, it means no control flow.
+  trace_config:
+    init_text_range: [1, 2]
+    init_voice_range: [1, 2]
+    max_init_state_num: 3
+
+agent_config:
+  max_iterations: 3
+  

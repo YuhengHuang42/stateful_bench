@@ -1,0 +1,22 @@
+
+task: "session"
+env:
+  base_url: "http://172.17.0.1:8080"
+  trace_save_path: "/data/stateful_bench/session_trace"
+  agent_save_path: "/data/stateful_bench/session_trace/agent_data"
+  openai_api_key: ""
+  google_api_key: ""
+  open_source_api_key: ""
+  open_source_base_url: ""
+  # 1. 
+generation_config:
+  num_of_tests: 60
+  num_of_apis: 5
+  control_position_candidate: [3, 4] # When idx == 4, it means no control flow. We delete [1, 2] because that will lead the program to be too long.
+  trace_config:
+    init_local_state_num_range: [2, 3]
+    init_implicit_state_num_range: [3, 6]
+
+agent_config:
+  max_iterations: 3
+  
