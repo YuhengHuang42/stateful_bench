@@ -1788,7 +1788,8 @@ class VoiceEvaluator(ProgramEvaluator):
                             "result_pass": True,
                             "error_info": None,
                             "state_pass": False,
-                            "state_pass_detail": "Call mismatch: more calls than expected"
+                            "state_pass_detail": "Call mismatch: more calls than expected",
+                            #"state_detail": {"state_info": state_info, "state_oracle": test_case["state_oracle"], "state_oracle_list": state_oracle_list}
                         })
                         pass_list.append(False)
                         fail = True
@@ -1800,7 +1801,8 @@ class VoiceEvaluator(ProgramEvaluator):
                         "result_pass": True,
                         "error_info": None,
                         "state_pass": False,
-                        "state_pass_detail": "Call mismatch: less calls than expected"
+                        "state_pass_detail": "Call mismatch: less calls than expected",
+                        #"state_detail": {"state_info": state_info, "state_oracle": test_case["state_oracle"], "state_oracle_list": state_oracle_list}
                     })
                     pass_list.append(False)
                     continue
