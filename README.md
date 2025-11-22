@@ -35,6 +35,14 @@ The dataset is available at: https://drive.google.com/drive/folders/1k_86uiFLU7M
 
 Please download the dataset and configure the corresponding files under `config`. For evaluation purpose, you can skip the trace generation from step 1 to step 3 and directly evaluate the LLMs with the generated instructions.
 
+We load the dataset through `StateEval` class, which is defined in `Sgenerator/state.py`. It is used in `llm_evaluation.py`, but you can also use in your own scripts as well.
+
+```python
+stateful_bench = StateEval(parent_path, config_dict["task"], config_dict, api_doc)
+```
+
+The dataset can be directly iterated through. And the evaluation is done by calling the `evaluate` method.
+
 ## End-to-End Workflow
 
 1. **Configure a task** (session, tensor, or voice) via YAML.
