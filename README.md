@@ -28,8 +28,9 @@ The `StateEvalHF` class is a HuggingFace versiion of the `StateEval` class. It i
 
 - Python 3.10+ with `pip install typer loguru numpy pyyaml openai tqdm torch google-genai`.
 - (Optional) Access credentials for the models you plan to evaluate (OpenAI, Google Gemini, or supported open-source gateways).
-- Storage for generated traces and prompts (set via config files, StateEval available in our Google Drive).
+- Storage for generated traces and prompts (set via config files, StateEval available through HuggingFace).
 - A running backend for the task under study (e.g., launch `session-service` via Docker when benchmarking the session APIs).
+- Pytorch version should be generally OK for the tensor task. But we only test the code on Pytorch 2.4.1.
 
 > **Keep secrets out of version control.** Copy the example configs, fill in your own keys, and avoid committing them.
 
