@@ -1,4 +1,5 @@
 from typing import Callable, Any, Dict, List, Optional, Tuple, Set, Union
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 import re
@@ -1453,12 +1454,20 @@ class TensorEvaluator(ProgramEvaluator):
             json.dump(saved_info, f, indent=2)
             
     @classmethod
-    def load(cls, file_path: str, config: Dict[str, Any] = None):
+    def load(cls, file_path: Union[str, Dict[str, Any], Mapping], config: Dict[str, Any] = None):
         """Load test cases from disk. Converts lists back to torch tensors."""
-        
-        # Load from file
-        with open(file_path, 'r') as f:
-            saved_info = json.load(f)
+        if isinstance(file_path, Mapping):
+            saved_info = dict(file_path)
+        elif isinstance(file_path, str):
+            # Load from file
+            with open(file_path, 'r') as f:
+                saved_info = json.load(f)
+        else:
+            try:
+                saved_info = dict(file_path)  # type: ignore
+            except Exception:
+                with open(file_path, 'r') as f:
+                    saved_info = json.load(f)
         if config is None:
             config = saved_info["config"]
         created_cls = cls(config)

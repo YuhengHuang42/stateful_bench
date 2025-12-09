@@ -1,4 +1,5 @@
-from typing import Callable, Any, Dict, List, Optional, Tuple, Set
+from typing import Callable, Any, Dict, List, Optional, Tuple, Set, Union
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 import re
@@ -1786,9 +1787,18 @@ class SessionEvaluator(ProgramEvaluator):
         super().__init__()
         
     @classmethod
-    def load(cls, file_path: str, config: Dict[str, Any] = None):
-        with open(file_path, "r") as f:
-            saved_info = json.load(f)
+    def load(cls, file_path: Union[str, Dict[str, Any], Mapping], config: Dict[str, Any] = None):
+        if isinstance(file_path, Mapping):
+            saved_info = dict(file_path)
+        elif isinstance(file_path, str):
+            with open(file_path, "r") as f:
+                saved_info = json.load(f)
+        else:
+            try:
+                saved_info = dict(file_path)  # type: ignore
+            except Exception:
+                with open(file_path, "r") as f:
+                    saved_info = json.load(f)
         if config is None:
             config = saved_info["config"]
         created_cls =  cls(config)

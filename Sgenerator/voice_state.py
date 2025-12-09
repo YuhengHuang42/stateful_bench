@@ -1,5 +1,6 @@
 from collections import OrderedDict, defaultdict
-from typing import Any, Dict, List, Set, Tuple, Optional
+from typing import Any, Dict, List, Set, Tuple, Optional, Union
+from collections.abc import Mapping
 import copy
 from enum import Enum
 from faker import Faker
@@ -1530,8 +1531,8 @@ class VoiceEvaluator(ProgramEvaluator):
             json.dump(saved_info, f, indent=2)
     
     @classmethod
-    def load(cls, file_path: str, config: Dict[str, Any] = None):
-        """Load test cases from disk. Converts JSON back to Speech objects."""
+    def load(cls, file_path: Union[str, Dict[str, Any], Mapping], config: Dict[str, Any] = None):
+        """Load test cases from disk or a serialized payload. Converts JSON back to Speech objects."""
         
         def json_to_speech(obj):
             """Recursively convert JSON format back to Speech objects."""
@@ -1544,9 +1545,19 @@ class VoiceEvaluator(ProgramEvaluator):
                 return [json_to_speech(item) for item in obj]
             return obj
 
-        # Load from file
-        with open(file_path, 'r') as f:
-            saved_info = json.load(f)
+        # Load from file or dict-like payload
+        if isinstance(file_path, Mapping):
+            saved_info = dict(file_path)
+        elif isinstance(file_path, str):
+            with open(file_path, 'r') as f:
+                saved_info = json.load(f)
+        else:
+            # Fallback: try to treat as mapping first, else expect a path-like
+            try:
+                saved_info = dict(file_path)  # type: ignore
+            except Exception:
+                with open(file_path, 'r') as f:
+                    saved_info = json.load(f)
         
         if config is None:
             config = saved_info["config"]

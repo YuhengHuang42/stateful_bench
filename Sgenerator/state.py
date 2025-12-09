@@ -1,4 +1,4 @@
-from typing import Callable, Any, Dict, List, Optional, Set, Tuple
+from typing import Callable, Any, Dict, List, Optional, Set, Tuple, Union
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import random
@@ -7,6 +7,7 @@ from loguru import logger
 import copy
 import os
 import json
+from pathlib import Path
 from . import utils
 USER_FUNCTION_PARAM_FLAG = "user_variable"
 USER_CONSTANT_FLAG = "user_constant"
@@ -927,7 +928,7 @@ class StateEval():
         self.evaluator_book = dict()
         self.prompt_book = dict()
         for file in os.listdir(self.parent_path): # Load Evaluators
-            if file.endswith(".json"):
+            if file.endswith(".json") and file.startswith("evaluator_"):
                 idx = int(file.split('_')[1].split('.')[0])
                 self.evaluator_book[idx] = self.evaluator_class.load(os.path.join(self.parent_path, file), evaluation_config)
         
@@ -954,6 +955,123 @@ class StateEval():
             return prompt
         else:
             return None
+    
+    def __getitem__(self, idx: int):
+        real_idx = self.index_list[idx]
+        return self.prompt_book[str(real_idx)]
+    
+    def __len__(self):
+        return len(self.index_list)
+    
+    def evaluate(self, idx: int, program: str):
+        real_idx = self.index_list[idx]
+        evaluator = self.evaluator_book[real_idx]
+        result = evaluator.evaluate(program)
+        return result
+    
+    def get_reference_code(self, idx: int):
+        real_idx = self.index_list[idx]
+        evaluator = self.evaluator_book[real_idx]
+        gt = evaluator.test_cases[0]["program"]
+        return gt
+    
+class StateEvalHF():
+    def __init__(
+        self,
+        task: str,
+        hf_repo_id: Optional[str]=None,
+        hf_split: Optional[str]=None,
+        hf_revision: Optional[str]=None,
+        hf_local_path: Optional[str]=None,
+        evaluation_config: Optional[Dict[str, Any]]=None,
+    ):
+        """
+        StateEval orchestrates prompt construction and evaluation for each task.
+
+
+        hf_repo_id: Hugging Face dataset repo id to pull instead of a local folder
+        hf_local_path: path produced by datasets.save_to_disk(...) to load locally
+        """
+        self.task = task
+        use_hf_dataset = hf_repo_id is not None or hf_local_path is not None
+
+        if not use_hf_dataset:
+            raise ValueError("StateEvalHF requires a Hugging Face dataset source (repo or local dataset).")
+        
+        assert self.task in ["session", "tensor", "voice"]
+        task_specific_prompt = None
+        if self.task == "session":
+            from Sgenerator.session_state import SessionEvaluator, SESSION_GENERATION_PROMPT
+            evaluator_class = SessionEvaluator
+            task_specific_prompt = SESSION_GENERATION_PROMPT
+        elif self.task == "tensor":
+            from Sgenerator.tensor_state import TensorEvaluator, TENSOR_GENERATION_PROMPT
+            evaluator_class = TensorEvaluator
+            task_specific_prompt = TENSOR_GENERATION_PROMPT
+        elif self.task == "voice":
+            from Sgenerator.voice_state import VoiceEvaluator, VOICE_GENERATION_PROMPT
+            evaluator_class = VoiceEvaluator
+            task_specific_prompt = VOICE_GENERATION_PROMPT
+        else:
+            raise ValueError(f"Invalid task: {self.task}")
+        self.evaluator_class = evaluator_class
+        
+        self.evaluator_book = dict()
+        self.prompt_book = dict()
+
+        rows = self._load_dataset_rows(hf_repo_id, hf_split, hf_revision, hf_local_path)
+        self._build_from_rows(rows, evaluation_config or {}, task_specific_prompt)
+
+        missing_prompts = [idx for idx in self.evaluator_book.keys() if str(idx) not in self.prompt_book]
+        if missing_prompts:
+            logger.warning(f"Missing prompts for indices {missing_prompts}; they will be skipped.")
+
+        # Only keep indices that have both evaluator and prompt.
+        self.index_list = [idx for idx in sorted(self.evaluator_book.keys()) if str(idx) in self.prompt_book]
+
+    def _load_dataset_rows(self, repo_id: Optional[str], split: Optional[str], revision: Optional[str], local_path: Optional[str]):
+        """Load serialized evaluators/agent data from Hugging Face or a local saved dataset."""
+        try:
+            from datasets import load_dataset, load_from_disk, DatasetDict
+        except ImportError as exc:
+            raise ImportError("datasets package is required to load Hugging Face sources.") from exc
+
+        # Default: use task name as split when not provided to support multi-task datasets.
+        resolved_split = split or self.task
+
+        dataset = load_dataset(repo_id, split=resolved_split, revision=revision)
+
+        rows = list(dataset)
+        if not rows:
+            raise RuntimeError("No rows found in the provided dataset source.")
+        rows = sorted(rows, key=lambda r: int(r["example_id"]))
+        return rows
+
+    def _build_from_rows(self, rows: List[dict], evaluation_config: Dict[str, Any], task_specific_prompt: str):
+        """Build evaluator/prompt books from HF dataset rows."""
+        if not rows:
+            return
+        # Metadata is duplicated per row; take the first.
+        meta_raw = rows[0].get("metadata_json")
+        if meta_raw:
+            metadata_payload = json.loads(meta_raw) if isinstance(meta_raw, str) else meta_raw
+            evaluation_config = metadata_payload.get("evaluation_config", evaluation_config)
+            self.doc = metadata_payload.get("doc", getattr(self, "doc", ""))
+        else:
+            logger.warning("No metadata_json found in HF dataset rows; doc/evaluation_config may be empty.")
+
+        for row in rows:
+            idx = int(row["example_id"])
+            evaluator_payload_raw = row.get("evaluator_json")
+            if isinstance(evaluator_payload_raw, str):
+                evaluator_payload = json.loads(evaluator_payload_raw)
+            else:
+                evaluator_payload = evaluator_payload_raw
+            self.evaluator_book[idx] = self.evaluator_class.load(evaluator_payload, evaluation_config)
+            prompt = row.get("prompt")
+            if prompt:
+                self.prompt_book[str(idx)] = prompt
+    
     
     def __getitem__(self, idx: int):
         real_idx = self.index_list[idx]
