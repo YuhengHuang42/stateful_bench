@@ -4,6 +4,7 @@ StateGen is an automated framework for benchmarking large language models (LLMs)
 
 **News:** We now support the evaluation of the benchmark from HuggingFace. You can use the `StateEvalHF` class to load the dataset from HuggingFace.
 ```python
+import Sgenerator.state as state
 data = state.StateEvalHF(task="session", hf_repo_id="yuhenghuang/StateEval", hf_split="session")
 ```
 The `StateEvalHF` class is a HuggingFace version of the `StateEval` class. We divided our three scenarios into three `hf_split`. 
@@ -45,6 +46,7 @@ We have two implementations of the benchmark. One is the local version, which is
 You can now distribute the exact same evaluation artifacts via the Hugging Face Hub and load them with `datasets.load_dataset`.
 
 1. **Package a single dataset directory**
+   
    ```
    python scripts/hf_dataset.py pack \
      --trace-dir /abs/path/outputs/session_traces \
@@ -52,25 +54,28 @@ You can now distribute the exact same evaluation artifacts via the Hugging Face 
      --repo-id your-hf-org/stategen-session \
      --push  # optional
    ```
+   
    - `trace-dir` must contain the `evaluator_*.json` files and `agent_data/agent_data.json`.
    - When `--push` is omitted the dataset is only saved locally (`save_to_disk`). Add `--push` to upload to the Hub (requires `huggingface-cli login` beforehand). Use `--private` if the repo should be private.
    - Notice: you need to prepare a metadata file under the trace directory. For example:
+
    ```
     voice_metadata = {
       "evaluation_config": {},
       "doc": api_doc,
       "prompt_book": voice_bench.prompt_book
-      
-  }
+     }
    ```
-   The prompt_book can be obtained by StateEval class (it is actually obtained from the agent_data.json returned by our translation agent). For example:
+
+   The `prompt_book` can be obtained by `StateEval` class (it is actually obtained from the agent_data.json returned by our translation agent). For example:
+
    ```
    voice_bench = StateEval(parent_path, config_dict["task"], config_dict, api_doc)
    prompt_book = voice_bench.prompt_book
    ```
 
 
-2. **Use the dataset directly in Python (optional)**
+2. **Use the dataset directly in Python**
    ```python
    import Sgenerator.state as state
    data = state.StateEvalHF(task="session", hf_repo_id="yuhenghuang/StateEval", hf_split="session")
