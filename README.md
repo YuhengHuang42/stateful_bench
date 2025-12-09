@@ -55,7 +55,7 @@ You can now distribute the exact same evaluation artifacts via the Hugging Face 
      --push  # optional
    ```
    
-   - `trace-dir` must contain the `evaluator_*.json` files and `agent_data/agent_data.json`.
+   - `trace-dir` must contain the `evaluator_*.json` files.
    - When `--push` is omitted the dataset is only saved locally (`save_to_disk`). Add `--push` to upload to the Hub (requires `huggingface-cli login` beforehand). Use `--private` if the repo should be private.
    - Notice: you need to prepare a metadata file under the trace directory. For example:
 
