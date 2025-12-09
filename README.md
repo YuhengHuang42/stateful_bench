@@ -1,6 +1,12 @@
-# StateGen
+# StateEval
 
-StateGen is an automated framework for benchmarking large language models (LLMs) on **sequential, stateful API calls**. It generates coverage-guided execution traces, translates them into natural-language programming tasks, and evaluates LLM-produced programs against executable test suites.
+StateGen is an automated framework for benchmarking large language models (LLMs) on **sequential, stateful API calls**. It generates coverage-guided execution traces, translates them into natural-language programming tasks, and evaluates LLM-produced programs against executable test suites. StateEval, containing 120 test cases, is a benchmark created based on StateGen and verified manually.
+
+**News:** We now support the evaluation of the benchmark from HuggingFace. You can use the `StateEvalHF` class to load the dataset from HuggingFace.
+```python
+data = state.StateEvalHF(task="session", hf_repo_id="yuhenghuang/StateEval", hf_split="session")
+```
+The `StateEvalHF` class is a HuggingFace versiion of the `StateEval` class. It is used to load the dataset from HuggingFace.
 
 ---
 
@@ -31,9 +37,46 @@ StateGen is an automated framework for benchmarking large language models (LLMs)
 
 ## Evaluation Benchmark
 
-The dataset is available at: https://drive.google.com/drive/folders/1k_86uiFLU7MWcuS3YD8qwGLjK-Z8aP03?usp=sharing
+We have two implementations of the benchmark. One is the local version, which is stored in a folder. The other is the HuggingFace version, which is stored in a HuggingFace dataset. The former one is used to help you prepare your locally generated dataset for the evaluation. And the latter one is used to evaluate the LLMs on the benchmark from HuggingFace.
 
-Please download the dataset and configure the corresponding files under `config`. For evaluation purpose, you can skip the trace generation from step 1 to step 3 and directly evaluate the LLMs with the generated instructions.
+### Publishing / consuming the dataset via Hugging Face
+
+You can now distribute the exact same evaluation artifacts via the Hugging Face Hub and load them with `datasets.load_dataset`.
+
+1. **Package a single dataset directory**
+   ```
+   python scripts/hf_dataset.py pack \
+     --trace-dir /abs/path/outputs/session_traces \
+     --output-dir /abs/path/outputs/session_traces_hf \
+     --repo-id your-hf-org/stategen-session \
+     --push  # optional
+   ```
+   - `trace-dir` must contain the `evaluator_*.json` files and `agent_data/agent_data.json`.
+   - When `--push` is omitted the dataset is only saved locally (`save_to_disk`). Add `--push` to upload to the Hub (requires `huggingface-cli login` beforehand). Use `--private` if the repo should be private.
+   - Notice: you need to prepare a metadata file under the trace directory. For example:
+   ```
+    voice_metadata = {
+      "evaluation_config": {},
+      "doc": api_doc,
+      "prompt_book": voice_bench.prompt_book
+      
+  }
+   ```
+   The prompt_book can be obtained by StateEval class (it is actually obtained from the agent_data.json returned by our translation agent). For example:
+   ```
+   voice_bench = StateEval(parent_path, config_dict["task"], config_dict, api_doc)
+   prompt_book = voice_bench.prompt_book
+   ```
+
+
+2. **Use the dataset directly in Python (optional)**
+   ```python
+   import Sgenerator.state as state
+   data = state.StateEvalHF(task="session", hf_repo_id="yuhenghuang/StateEval", hf_split="session")
+   ```
+   StateEvalHF class is a HuggingFace versiion of StateEval class. It is used to load the dataset from HuggingFace.
+
+
 
 We load the dataset through `StateEval` class, which is defined in `Sgenerator/state.py`. It is used in `llm_evaluation.py`, but you can also use in your own scripts as well.
 
