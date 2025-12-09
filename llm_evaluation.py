@@ -1,3 +1,6 @@
+"""
+This script is used to evaluate the LLM performance on the (local version of) stateful benchmark.
+"""
 import typer
 from Sgenerator.state import StateEval
 from typing import Annotated
@@ -215,10 +218,3 @@ def main(
     
 if __name__ == "__main__":
     app()
-        
-        
-        
-        
-        
-        
-        
