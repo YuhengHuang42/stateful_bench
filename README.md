@@ -6,7 +6,7 @@ StateGen is an automated framework for benchmarking large language models (LLMs)
 ```python
 data = state.StateEvalHF(task="session", hf_repo_id="yuhenghuang/StateEval", hf_split="session")
 ```
-The `StateEvalHF` class is a HuggingFace versiion of the `StateEval` class. It is used to load the dataset from HuggingFace.
+The `StateEvalHF` class is a HuggingFace version of the `StateEval` class. We divided our three scenarios into three `hf_split`. 
 
 ---
 
