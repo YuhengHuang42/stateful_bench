@@ -6,7 +6,7 @@ import pickle
 import os
 from loguru import logger
 
-from Sgenerator.state import generate_and_collect_test_case
+from Sgenerator.state import generate_and_collect_test_case, OccurenceBook
 
 app = typer.Typer(pretty_exceptions_show_locals=False, pretty_exceptions_short=False)
 
@@ -14,6 +14,8 @@ app = typer.Typer(pretty_exceptions_show_locals=False, pretty_exceptions_short=F
 def main(
     config_file: Annotated[Path, typer.Option()],
     trace_save_path: Annotated[Path, typer.Option()] = None,
+    occurence_book_path: Annotated[Path, typer.Option(help="Path to persistent OccurenceBook JSON. "
+                                                           "Created if missing; reloaded across runs.")] = None,
 ):
     with open(config_file, 'r') as file:
         config_dict = yaml.safe_load(file)
@@ -25,7 +27,17 @@ def main(
 
     if trace_save_path is None:
         trace_save_path = config_dict["env"]["trace_save_path"]
-    
+
+    if occurence_book_path is None:
+        occurence_book_path = os.path.join(trace_save_path, "occurence_book.json")
+
+    occurence_book = OccurenceBook.load(str(occurence_book_path))
+
+    if occurence_book.has_pending_discards():
+        logger.info(f"Applying {len(occurence_book.pending_discards)} pending discards from previous LLM review.")
+        removed = occurence_book.apply_discards()
+        logger.info(f"Removed {len(removed)} fully-zeroed transition pairs.")
+
     evaluation_config = {}
     if config_dict["task"] == "session":
         from Sgenerator.session_state import SessionEvaluator, SessionRandomInitializer, SessionVariableSchema
@@ -46,8 +58,7 @@ def main(
         evaluator_class = VoiceEvaluator
     else:
         raise ValueError(f"Task {config_dict['task']} is not supported.")
-        
-    occurence_book = {}
+
     evaluator_book = {}
     occ_book_diff_recorder = {}
     idx = 0
@@ -75,10 +86,14 @@ def main(
     for idx in evaluator_book:
         evaluator_save_path = os.path.join(trace_save_path, f"evaluator_{idx}.json")
         evaluator_book[idx].store(evaluator_save_path)
+
+    occurence_book.save(str(occurence_book_path))
+    logger.info(f"OccurenceBook saved to {occurence_book_path}")
+
     metadata_save_path = os.path.join(trace_save_path, "metadata.pkl")
     with open(metadata_save_path, 'wb') as file:
         pickle.dump({
-            "occurence_book": occurence_book,
+            "occurence_book": occurence_book.to_dict(),
             "config": config_dict,
             "occ_book_diff_recorder": occ_book_diff_recorder
         }, file)

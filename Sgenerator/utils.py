@@ -37,16 +37,17 @@ def get_nested_path_string(dct_str: str, key_list: list):
     return path
 
 def get_added_changes(old_book, new_book):
+    """Compute diff between two occurrence books (works with both dicts and OccurenceBook)."""
+    old_get = old_book.get if hasattr(old_book, 'get') else lambda k, d=0: old_book.get(k, d)
     changes = {}
     for k, v in new_book.items():
-        if k not in old_book:
-            # New key
+        old_val = old_get(k, 0)
+        if old_val == 0:
             changes[k] = v
         else:
-            assert v >= old_book[k], f"The number of occurence of {k} is decreased from {old_book[k]} to {v}."
-            # Existing key with increased value
-            if v > old_book[k]:
-                changes[k] = v - old_book[k]
+            assert v >= old_val, f"The number of occurence of {k} is decreased from {old_val} to {v}."
+            if v > old_val:
+                changes[k] = v - old_val
     return changes
 
 def write_jsonl(output_path, data):

@@ -7,9 +7,329 @@ from loguru import logger
 import copy
 import os
 import json
+import filelock
 from pathlib import Path
 from . import utils
+
 USER_FUNCTION_PARAM_FLAG = "user_variable"
+
+
+PAIR_SEP = "||"
+
+
+def _pair_to_key(pair: Tuple[str, str]) -> str:
+    return f"{pair[0]}{PAIR_SEP}{pair[1]}"
+
+
+def _key_to_pair(key: str) -> Tuple[str, str]:
+    parts = key.split(PAIR_SEP, 1)
+    return (parts[0], parts[1])
+
+
+class OccurenceBook:
+    """Persistent, process-safe occurrence book for transition-pair coverage.
+
+    Internally stores ``{pair_key: count}`` where *pair_key* is a
+    ``(str, str)`` tuple.  Persistence is backed by a JSON file protected
+    with a file-lock so that multiple processes (e.g. LLM workers) can
+    safely read / write.
+
+    API Summary
+    -----------
+    - ``record(pair)`` / ``record_many(pairs)``
+        Increment occurrence counts.  Called automatically by
+        ``TraceGenerator.generate_trace``.
+
+    - ``begin_round()`` / ``get_round_transitions()`` / ``end_round()``
+        **Caller-managed** round tracking.  These are *not* called by
+        ``TraceGenerator`` or ``generate_and_collect_test_case``; it is
+        the caller's responsibility to bracket each generation round.
+        ``end_round`` returns the diff and clears the snapshot;
+        ``get_round_transitions`` returns the diff without clearing it
+        (idempotent, can be called multiple times within a round).
+
+    - ``inject_transition(pair, count)`` / ``inject_transitions(dict)``
+        Add transitions from an external source (e.g. LLM-generated
+        new dependencies).  Uses *max* semantics: the count is set to
+        at least the given value.
+
+    - ``mark_discarded(pair, count)`` / ``mark_discarded_many(pairs)``
+        Flag pairs for later removal.  ``count=-1`` means remove entirely.
+
+    - ``apply_discards()``
+        Subtract flagged counts and drop zeroed entries.  Returns the
+        set of pairs that were fully removed.
+
+    - ``save(path)`` / ``load(path)``
+        JSON persistence protected by a file-lock.
+
+    Important: Deep-Copy Boundary
+    -----------------------------
+    ``TraceGenerator.__init__`` **deep-copies** the book it receives.
+    After generation, the *copy* (available via ``result["occurence_book"]``
+    or ``trace_generator.occurence_book``) holds the updated state
+    including the round snapshot.  The original book is untouched.
+
+    Usage Scenarios
+    ---------------
+    **Scenario 1 — No LLM, plain generation loop** ::
+
+        book = OccurenceBook()                 # or .load(path)
+        for _ in range(N):
+            _, ok, new_book, diff = generate_and_collect_test_case(
+                ..., occurence_book=book)
+            if ok:
+                book = new_book                # adopt the copy
+        book.save(path)
+
+    ``begin_round`` / ``end_round`` are not needed here; the per-round
+    diff is already returned as ``diff`` (computed by
+    ``utils.get_added_changes``).
+
+    **Scenario 2 — LLM reviews and changes some transitions** ::
+
+        book = OccurenceBook.load(path)
+        book.apply_discards()                  # apply any pending from last LLM run
+
+        book.begin_round()                     # <-- snapshot before generation
+        _, ok, new_book, _ = generate_and_collect_test_case(
+            ..., occurence_book=book)
+        if ok:
+            book = new_book
+        round_diff = book.end_round()          # <-- pairs added this round
+
+        # Send round_diff to LLM for review ...
+        # LLM decides pairs X, Y are invalid:
+        book.mark_discarded(X, count=-1)
+        book.mark_discarded(Y, count=-1)
+        # LLM decides a new dependency Z should be injected:
+        book.inject_transition(Z, count=1)
+        book.save(path)
+
+        # On the *next* run, apply_discards() removes X and Y before
+        # generation resumes.
+
+    **Scenario 3 — LLM reviews but changes nothing** ::
+
+        book = OccurenceBook.load(path)
+        book.apply_discards()                  # no-op if nothing pending
+
+        book.begin_round()
+        _, ok, new_book, _ = generate_and_collect_test_case(
+            ..., occurence_book=book)
+        if ok:
+            book = new_book
+        round_diff = book.end_round()          # informational only
+
+        # LLM says everything is fine — no mark_discarded / inject calls.
+        book.save(path)
+    """
+
+    def __init__(self, data: Optional[Dict[Tuple[str, str], int]] = None,
+                 persist_path: Optional[str] = None):
+        self._data: Dict[Tuple[str, str], int] = dict(data) if data else {}
+        self._pending_discards: Dict[Tuple[str, str], int] = {}
+        self._persist_path: Optional[str] = persist_path
+        self._round_snapshot: Optional[Dict[Tuple[str, str], int]] = None
+
+    # ------------------------------------------------------------------
+    # dict-like interface (keeps call-sites mostly unchanged)
+    # ------------------------------------------------------------------
+    def get(self, pair: Tuple[str, str], default: int = 0) -> int:
+        return self._data.get(pair, default)
+
+    def __getitem__(self, pair: Tuple[str, str]) -> int:
+        return self._data[pair]
+
+    def __setitem__(self, pair: Tuple[str, str], value: int):
+        self._data[pair] = value
+
+    def __contains__(self, pair: Tuple[str, str]) -> bool:
+        return pair in self._data
+
+    def items(self):
+        return self._data.items()
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def __len__(self):
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __repr__(self):
+        return f"OccurenceBook({self._data!r})"
+
+    # ------------------------------------------------------------------
+    # Core helpers
+    # ------------------------------------------------------------------
+    def record(self, pair: Tuple[str, str]):
+        """Increment the occurrence count for *pair* by 1."""
+        self._data[pair] = self._data.get(pair, 0) + 1
+
+    def record_many(self, pairs):
+        """Convenience: record a list of pairs at once."""
+        for p in pairs:
+            self.record(p)
+
+    # ------------------------------------------------------------------
+    # Round tracking
+    # ------------------------------------------------------------------
+    def begin_round(self):
+        """Snapshot current state so that ``get_round_transitions`` can diff."""
+        self._round_snapshot = dict(self._data)
+
+    def get_round_transitions(self) -> Dict[Tuple[str, str], int]:
+        """Return transitions added since the last ``begin_round`` call.
+
+        Each key is a pair; the value is the number of *new* occurrences
+        recorded in this round (i.e. count_now - count_at_snapshot).
+        Pairs that existed before the round but were not touched are excluded.
+        """
+        if self._round_snapshot is None:
+            raise RuntimeError("begin_round() was not called before get_round_transitions().")
+        diff: Dict[Tuple[str, str], int] = {}
+        for pair, count in self._data.items():
+            old = self._round_snapshot.get(pair, 0)
+            if count > old:
+                diff[pair] = count - old
+        return diff
+
+    def end_round(self) -> Dict[Tuple[str, str], int]:
+        """Convenience: return the round diff and clear the snapshot."""
+        diff = self.get_round_transitions()
+        self._round_snapshot = None
+        return diff
+
+    # ------------------------------------------------------------------
+    # Inject transitions (e.g. from LLM adding new dependencies)
+    # ------------------------------------------------------------------
+    def inject_transitions(self, pairs_with_counts: Dict[Tuple[str, str], int]):
+        """Add transitions from an external source (e.g. LLM-generated deps).
+
+        Unlike ``record``, which always increments by 1, this sets the count
+        to at least the given value.  If the pair already has a higher count,
+        it keeps the higher one.
+        """
+        for pair, count in pairs_with_counts.items():
+            self._data[pair] = max(self._data.get(pair, 0), count)
+
+    def inject_transition(self, pair: Tuple[str, str], count: int = 1):
+        """Inject a single transition pair."""
+        self._data[pair] = max(self._data.get(pair, 0), count)
+
+    # ------------------------------------------------------------------
+    # Discard workflow
+    # ------------------------------------------------------------------
+    def mark_discarded(self, pair: Tuple[str, str], count: int = 1):
+        """Flag *pair* for later removal (e.g. after LLM drops a dependency).
+
+        ``count`` is the number of occurrences to subtract.  Passing
+        ``count=-1`` means "remove entirely regardless of current count".
+        """
+        self._pending_discards[pair] = self._pending_discards.get(pair, 0) + count
+
+    def mark_discarded_many(self, pairs, count: int = 1):
+        for p in pairs:
+            self.mark_discarded(p, count)
+
+    @property
+    def pending_discards(self) -> Dict[Tuple[str, str], int]:
+        return dict(self._pending_discards)
+
+    def apply_discards(self):
+        """Apply all pending discards: subtract counts and drop zeroed entries.
+
+        Returns the set of pairs that were fully removed.
+        """
+        removed: set = set()
+        for pair, dec in list(self._pending_discards.items()):
+            if pair not in self._data:
+                continue
+            if dec == -1:
+                removed.add(pair)
+            else:
+                self._data[pair] = max(0, self._data[pair] - dec)
+                if self._data[pair] == 0:
+                    removed.add(pair)
+        for pair in removed:
+            self._data.pop(pair, None)
+        self._pending_discards.clear()
+        return removed
+
+    def has_pending_discards(self) -> bool:
+        return len(self._pending_discards) > 0
+
+    # ------------------------------------------------------------------
+    # Serialization helpers (JSON, process-safe)
+    # ------------------------------------------------------------------
+    def to_dict(self) -> dict:
+        """Return a JSON-serialisable plain dict."""
+        result = {
+            "data": {_pair_to_key(k): v for k, v in self._data.items()},
+            "pending_discards": {_pair_to_key(k): v for k, v in self._pending_discards.items()},
+        }
+        if self._round_snapshot is not None:
+            result["round_snapshot"] = {_pair_to_key(k): v for k, v in self._round_snapshot.items()}
+        return result
+
+    @classmethod
+    def from_dict(cls, d: dict, persist_path: Optional[str] = None) -> "OccurenceBook":
+        data = {_key_to_pair(k): v for k, v in d.get("data", {}).items()}
+        obj = cls(data=data, persist_path=persist_path)
+        obj._pending_discards = {_key_to_pair(k): v for k, v in d.get("pending_discards", {}).items()}
+        if "round_snapshot" in d:
+            obj._round_snapshot = {_key_to_pair(k): v for k, v in d["round_snapshot"].items()}
+        return obj
+
+    def save(self, path: Optional[str] = None):
+        """Persist to *path* (or ``self._persist_path``) with a file lock."""
+        target = path or self._persist_path
+        if target is None:
+            raise ValueError("No persist_path configured and no path argument given.")
+        lock = filelock.FileLock(target + ".lock")
+        with lock:
+            with open(target, "w") as f:
+                json.dump(self.to_dict(), f)
+        self._persist_path = target
+
+    @classmethod
+    def load(cls, path: str) -> "OccurenceBook":
+        """Load from *path* with a file lock.  Returns empty book if missing."""
+        if not os.path.exists(path):
+            return cls(persist_path=path)
+        lock = filelock.FileLock(path + ".lock")
+        with lock:
+            with open(path, "r") as f:
+                d = json.load(f)
+        return cls.from_dict(d, persist_path=path)
+
+    # ------------------------------------------------------------------
+    # deepcopy support (used by if/else branch forking)
+    # ------------------------------------------------------------------
+    def __deepcopy__(self, memo):
+        new = OccurenceBook(
+            data=copy.deepcopy(self._data, memo),
+            persist_path=self._persist_path,
+        )
+        new._pending_discards = copy.deepcopy(self._pending_discards, memo)
+        new._round_snapshot = copy.deepcopy(self._round_snapshot, memo)
+        return new
+
+    # ------------------------------------------------------------------
+    # Migration helper
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_raw_dict(cls, raw: Dict, persist_path: Optional[str] = None) -> "OccurenceBook":
+        """Create from a legacy plain ``{tuple: int}`` dict."""
+        return cls(data=raw, persist_path=persist_path)
+
+
 USER_CONSTANT_FLAG = "user_constant"
 RESPONSE_VARIABLE_TEMP = "response_{}"
 RESULT_NAME = "RESULT"
@@ -339,7 +659,7 @@ class TraceGenerator:
                  state_schema: Schema, 
                  random_generator: Any, 
                  config: Dict[str, Any],
-                 occurence_book: Dict[str, Any]):
+                 occurence_book: Union[OccurenceBook, Dict]):
         """
         config:
             - init_local_state_num_range: the range of the number of local states to be initialized. [min, max]
@@ -350,7 +670,10 @@ class TraceGenerator:
         self.random_generator = random_generator
         self.config = config
         self.random_generate_config = config["random_generate_config"] if "random_generate_config" in config else {}
-        self.occurence_book = copy.deepcopy(occurence_book) # pair -> occurence
+        if isinstance(occurence_book, OccurenceBook):
+            self.occurence_book = copy.deepcopy(occurence_book)
+        else:
+            self.occurence_book = OccurenceBook.from_raw_dict(copy.deepcopy(occurence_book))
         
     def prepare_initial_state(self):
         """
@@ -399,8 +722,7 @@ class TraceGenerator:
             if enter_postprocess_stage and not disable_postprocess:
                 for idx, transition in enumerate(postprocess_transitions):
                     transition_pairs = transition["transition_pairs"]
-                    for pair in transition_pairs:
-                        self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
+                    self.occurence_book.record_many(transition_pairs)
                     transition_name = transition["transition_name"]
                     if transition_name not in this_trace_duplicate_local_variable_map:
                         this_trace_duplicate_local_variable_map[transition_name] = set([])
@@ -536,8 +858,7 @@ class TraceGenerator:
                     if enable_coverage:
                         selected_idx = random.choices(selection_to_coverage_map[selected], k=1)[0]
                 '''
-                for pair in available_transitions[selected[0]][selected[1]]["transition_pairs"]:
-                    self.occurence_book[pair] = self.occurence_book.get(pair, 0) + 1
+                self.occurence_book.record_many(available_transitions[selected[0]][selected[1]]["transition_pairs"])
                 target_transition_info = available_transitions[selected[0]][selected[1]]
                 producer = target_transition_info["producer_variable_idx"]
                 if producer is not None:
@@ -804,11 +1125,16 @@ def generate_and_collect_test_case(
     trace_config,
     num_of_apis=5,
     control_position_candidate=[3, 4],
-    occurence_book={},
+    occurence_book=None,
     evaluation_config={},
     enable_if_else=True,
     enable_coverage=True
     ):
+    if occurence_book is None:
+        occurence_book = OccurenceBook()
+    elif isinstance(occurence_book, dict):
+        occurence_book = OccurenceBook.from_raw_dict(occurence_book)
+
     state_schema = schema_class()
     random_init = random_init_class()
     trace_generator = TraceGenerator(
