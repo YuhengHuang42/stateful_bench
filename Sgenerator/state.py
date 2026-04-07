@@ -1,3 +1,10 @@
+"""
+This module provides the core framework for generating random state transitions (traces). It includes base classes for defining state schemas (`Schema`), 
+tracking state variables (`State`), and defining transitions (`Transition`). 
+The `TraceGenerator` class is the central engine that orchestrates the generation of these traces, 
+including support for control flow like if/else branches. 
+It also provides evaluation utilities (`StateEval`, `StateEvalHF`) to assess LLM-generated code against the generated test cases.
+"""
 from typing import Callable, Any, Dict, List, Optional, Set, Tuple, Union
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -96,6 +103,7 @@ class OccurenceBook:
             ..., occurence_book=book)
         if ok:
             book = new_book
+        print("Round 1 diff:", book.get_round_transitions()) # <-- this is the diff information before the LLM review
         round_diff = book.end_round()          # <-- pairs added this round
 
         # Send round_diff to LLM for review ...
@@ -387,6 +395,11 @@ class State:
     created_by: str = None
 
 class Schema:
+    """
+    Base class for defining the state schema of a specific domain (e.g., Session, Tensor, Voice).
+    It manages both local variables (client-side) and implicit states (server-side/backend),
+    and defines the available transitions (API calls) that can be applied to these states.
+    """
     def __init__(self):
         self.init_local_info: List[Tuple[int, str, str]] = field(default_factory=list) # [(idx, name, value)] Used for the initialization of the user-defined variables.
         self.local_states = None
@@ -652,7 +665,9 @@ class RandomInitializer:
 
 class TraceGenerator:
     """
-    Generate a trace of the state changes.
+    Generate a trace of the state changes (a sequence of API calls).
+    It manages the initialization of states, selection of transitions based on coverage metrics, 
+    and the generation of the final trace program.
     Initialization --> transition selection --> trace generation
     """
     def __init__(self, 
@@ -1130,6 +1145,12 @@ def generate_and_collect_test_case(
     enable_if_else=True,
     enable_coverage=True
     ):
+    """
+    Main entry point for generating a single test case program and collecting its evaluation data.
+    It initializes the schema, generates a trace (with optional if/else branches), and uses the 
+    provided evaluator class to execute the program and collect the expected ground-truth states.
+    Returns the evaluator instance, success flag, updated occurrence book, and added coverage changes.
+    """
     if occurence_book is None:
         occurence_book = OccurenceBook()
     elif isinstance(occurence_book, dict):
@@ -1221,6 +1242,10 @@ def generate_and_collect_test_case(
 LLM_EVAL_PROMPT = '''You are provided with API documentation and task-specific instructions. Based on this information, generate the corresponding code to fulfill the task requirements.'''
 
 class StateEval():
+    """
+    Utility class for loading generated test cases and evaluating LLM-generated code against them.
+    It loads previously saved evaluator instances and constructs the appropriate prompts for LLMs.
+    """
     def __init__(self, parent_path: str, task: str, config_dict: dict, api_doc: str, agent_path: str=None):
         self.parent_path = parent_path
         self.task = task

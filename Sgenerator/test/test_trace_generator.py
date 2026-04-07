@@ -283,13 +283,14 @@ class TestFullLifecycle:
             random_init_class=TensorRandomInitializer,
             evaluator_class=TensorEvaluator,
             trace_config=TRACE_CONFIG,
-            num_of_apis=3,
+            num_of_apis=4,
             control_position_candidate=[2],
             occurence_book=book,
             enable_if_else=False,
             enable_coverage=False,
         )
         assert success
+        #print("Round 1 diff:", book.get_round_transitions())
         round1_diff = book.end_round()
         assert len(round1_diff) > 0
         book.save(persist)
@@ -310,12 +311,13 @@ class TestFullLifecycle:
             random_init_class=TensorRandomInitializer,
             evaluator_class=TensorEvaluator,
             trace_config=TRACE_CONFIG,
-            num_of_apis=3,
+            num_of_apis=4,
             control_position_candidate=[2],
             occurence_book=book3,
             enable_if_else=False,
             enable_coverage=False,
         )
         assert success
+        #print("Round 2 diff:", book3.get_round_transitions())
         round2_diff = book3.end_round()
         assert len(round2_diff) > 0
