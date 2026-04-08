@@ -1767,6 +1767,17 @@ class LocalEdit(Transition):
             result = if_block + result
         return result, ""
     
+def _strip_ids(obj):
+    """Recursively strip 'id' keys from dicts (and dicts inside lists)."""
+    if isinstance(obj, dict):
+        return {k: _strip_ids(v) for k, v in obj.items() if k != "id"}
+    if isinstance(obj, list):
+        return [_strip_ids(item) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_strip_ids(item) for item in obj)
+    return obj
+
+
 class SessionEvaluator(ProgramEvaluator):
     def __init__(self, 
                  #init_implicit_dict: Dict[str, Any],
@@ -1906,12 +1917,14 @@ class SessionEvaluator(ProgramEvaluator):
             response.raise_for_status()
             response_json = response.json()
             for session in response_json:
+                session_copy = {k: v for k, v in session.items() if k != "id"}
+                if isinstance(session_copy.get("data"), dict):
+                    session_copy["data"] = {k: v for k, v in session_copy["data"].items() if k != "id"}
                 if source_type not in oracle:
                     oracle[source_type] = []
-                oracle[source_type].append(session)
+                oracle[source_type].append(session_copy)
         
-        if result is not None and isinstance(result, dict) and "id" in result:
-            result.pop("id")
+        result = _strip_ids(result)
         test_case = {
             "result": result,
             "state_oracle": oracle,
@@ -1947,9 +1960,7 @@ class SessionEvaluator(ProgramEvaluator):
             # ====== Evaluate variable oracle ======
             try:
                 if f"{RESULT_NAME}" in namespace:
-                    result = namespace[RESULT_NAME]
-                    if result is not None and "id" in result:
-                        result.pop("id")
+                    result = _strip_ids(namespace[RESULT_NAME])
                     if isinstance(result, float) or isinstance(result, int):
                         if abs(result - test_case["result"]) > threshold:
                             result_pass = False
@@ -1991,12 +2002,16 @@ class SessionEvaluator(ProgramEvaluator):
                     source = session["source"]
                     type = session["type"]
                     data = session["data"]
+                    if isinstance(data, dict):
+                        data = {k: v for k, v in data.items() if k != "id"}
                     has_corresponding = False
                     for idx, oracle_session in enumerate(test_case["state_oracle"][source_type]):
                         if local_oracle_list[idx] == 1:
-                            # Already matched
                             continue
-                        if data == oracle_session["data"]:
+                        oracle_data = oracle_session.get("data")
+                        if isinstance(oracle_data, dict):
+                            oracle_data = {k: v for k, v in oracle_data.items() if k != "id"}
+                        if data == oracle_data:
                             local_oracle_list[idx] += 1
                             has_corresponding = True
                     if not has_corresponding:

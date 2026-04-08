@@ -10,6 +10,7 @@ import importlib
 import builtins
 import math
 import networkx as nx
+import re
 
 def load_file(file_path: str):
     result = []
@@ -186,7 +187,7 @@ def is_stdlib_from_string(name: str) -> bool:
         return False
     
 class APICallAnalyzer(ast.NodeVisitor):
-    def __init__(self):
+    def __init__(self, api_allowlist: Optional[Set[str]] = None):
         self.var_def: Dict[str, Set[Tuple[str, int]]] = {}  # var_name -> set of (api_func, api_lineno) origins (transitive)
         self.var_direct_def: Dict[str, Set[Tuple[str, int]]] = {}  # var_name -> set of (api_func, api_lineno) that directly assigned it (non-transitive)
         self.calls_set: Set[Tuple[Optional[str], Tuple[str, ...], str, int]] = set() # (assigned_var, sorted_args_tuple, func_name, lineno)
@@ -198,6 +199,7 @@ class APICallAnalyzer(ast.NodeVisitor):
         # if/else branch overwrites don't corrupt the data.
         # Key: (func_name, lineno)  Value: Dict[arg_var -> set of (api_func, api_lineno)]
         self.call_arg_direct_origins: Dict[Tuple[str, int], Dict[str, Set[Tuple[str, int]]]] = {}
+        self.api_allowlist = api_allowlist
     
     '''
     def _is_excluded(self, func_name: str) -> bool:
@@ -243,7 +245,21 @@ class APICallAnalyzer(ast.NodeVisitor):
                 # else: not in scope — handled in extract_state_transitions
             self.call_arg_direct_origins[key] = arg_origins
 
+    def _matches_allowlist(self, func_name: str) -> bool:
+        """Check if *func_name* matches any entry in ``self.api_allowlist``.
+
+        Matches on exact name **or** on the last dotted component so that
+        qualified names like ``torch.nn.functional.conv2d`` match the
+        bare doc name ``conv2d``.
+        """
+        if func_name in self.api_allowlist:
+            return True
+        last_component = func_name.rsplit(".", 1)[-1]
+        return last_component in self.api_allowlist
+
     def _is_excluded(self, func_name: str) -> bool:
+        if self.api_allowlist is not None:
+            return not self._matches_allowlist(func_name)
         if func_name in BUILTIN_FUNCS:
             return True
         if is_stdlib_from_string(func_name):
@@ -623,7 +639,10 @@ class APICallAnalyzer(ast.NodeVisitor):
         return transitions
 
 
-def extract_state_transitions(code: str) -> Dict[Tuple[str, str], int]:
+def extract_state_transitions(
+    code: str,
+    api_allowlist: Optional[Set[str]] = None,
+) -> Dict[Tuple[str, str], int]:
     """Static analysis entry point: extract (API_a, API_b) state transitions.
 
     Given a piece of Python source code, this function parses it, performs
@@ -641,6 +660,11 @@ def extract_state_transitions(code: str) -> Dict[Tuple[str, str], int]:
     ----------
     code : str
         Python source code to analyse.
+    api_allowlist : set of str, optional
+        When provided, only calls whose name matches an entry in this set
+        are treated as API calls.  Matching is by exact name or by the last
+        dotted component (e.g. ``torch.conv2d`` matches ``conv2d``).
+        When *None*, the default blacklist logic (builtins + stdlib) is used.
 
     Returns
     -------
@@ -658,21 +682,21 @@ def extract_state_transitions(code: str) -> Dict[Tuple[str, str], int]:
     ... resp = requests.get("http://example.com/api/sessions")
     ... data = resp.json()
     ... requests.post("http://example.com/api/update", json=data)
-    ... ''')
-    >>> ("requests.get", "resp.json") in transitions
-    True
-    >>> ("resp.json", "requests.post") in transitions
+    ... ''', api_allowlist={"requests.get", "requests.post"})
+    >>> ("requests.get", "requests.post") in transitions
     True
     """
     tree = ast.parse(code)
-    analyzer = APICallAnalyzer()
+    analyzer = APICallAnalyzer(api_allowlist=api_allowlist)
     analyzer.visit(tree)
     return analyzer.extract_state_transitions()
 
 
-def extract_transition_chains(code: str,
-                              include_none: bool = True,
-                              ) -> List[List[str]]:
+def extract_transition_chains(
+    code: str,
+    include_none: bool = True,
+    api_allowlist: Optional[Set[str]] = None,
+) -> List[List[str]]:
     """Extract all maximal transition chains from a piece of Python code.
 
     A chain is a sequence ``[API_a, API_b, ..., API_z]`` where each
@@ -689,6 +713,9 @@ def extract_transition_chains(code: str,
         If *True*, the ``"NONE"`` sentinel is kept as a chain root so chains
         look like ``["NONE", "torch.permute", "torch.cat"]``.  If *False*,
         ``"NONE"`` nodes are removed and chains start from the first real API.
+    api_allowlist : set of str, optional
+        Forwarded to ``APICallAnalyzer``.  See
+        ``extract_state_transitions`` for details.
 
     Returns
     -------
@@ -703,12 +730,12 @@ def extract_transition_chains(code: str,
     ... x = torch.randn(3, 4)
     ... y = torch.permute(x, (1, 0))
     ... z = torch.transpose(y, 0, 1)
-    ... ''')
+    ... ''', api_allowlist={"permute", "transpose"})
     >>> any("torch.permute" in c and "torch.transpose" in c for c in chains)
     True
     """
     tree = ast.parse(code)
-    analyzer = APICallAnalyzer()
+    analyzer = APICallAnalyzer(api_allowlist=api_allowlist)
     analyzer.visit(tree)
     transitions = analyzer.extract_state_transitions()
     return _chains_from_transitions(transitions, include_none=include_none)
@@ -836,3 +863,31 @@ def get_detail(load_statistics):
 
     assert len(syntax_error + result_wrong + execution_failed) == (40 - len(pass_list))
     return (syntax_error, execution_failed, result_wrong)
+
+# ---------------------------------------------------------------------------
+# API allowlist extraction
+# ---------------------------------------------------------------------------
+
+def _extract_api_names_from_doc(doc_text: str) -> Set[str]:
+    """Parse API documentation and return the set of valid API names.
+
+    Handles two documentation styles (the simplified version):
+
+    * **Function signatures** — lines matching ``def funcname(`` produce the
+      bare function name (e.g. ``conv2d``, ``search_voice_library``).
+    * **REST endpoints** — lines starting with an HTTP method
+      (``GET``, ``POST``, ``PUT``, ``DELETE``, ``PATCH``) followed by a path
+      produce ``requests.<method>`` (e.g. ``requests.get``).
+    """
+    names: Set[str] = set()
+    for m in re.finditer(r"^\s*def\s+(\w+)\s*\(", doc_text, re.MULTILINE):
+        names.add(m.group(1))
+    http_methods: Set[str] = set()
+    for m in re.finditer(
+        r"^(GET|POST|PUT|DELETE|PATCH)\s+/", doc_text, re.MULTILINE
+    ):
+        http_methods.add(m.group(1).lower())
+    for method in http_methods:
+        names.add(f"requests.{method}")
+    return names
+
