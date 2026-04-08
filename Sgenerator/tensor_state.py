@@ -2,6 +2,7 @@ from typing import Callable, Any, Dict, List, Optional, Tuple, Set, Union
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+import base64
 import re
 import copy
 import random
@@ -12,6 +13,7 @@ from collections import OrderedDict
 import requests
 import json
 import traceback
+import numpy as np
 import torch
 
 from Sgenerator.utils import get_nested_path_string
@@ -20,7 +22,7 @@ from Sgenerator.state import INDENT, RESULT_NAME, ProgramEvaluator, LocalVariabl
 
 MAX_LINEAR_FEATURES = 32
 MAX_KERNEL_SIZE = 7
-MAX_CHANNELS = 64
+MAX_CHANNELS = 32
 FLOAT_THRESHOLD = 1e-2
 
 TENSOR_SUMMARY_PROMPT = '''The below code is about a set of PyTorch tensor manipulation APIs that provide essential operations for deep learning and scientific computing. 
@@ -66,7 +68,7 @@ class TensorRandomInitializer(RandomInitializer):
             upper = dim_range[1]
         else:
             lower = 1
-            upper = 64
+            upper = 32
         dim1 = random.randint(lower, upper)
         dim2 = random.randint(lower, upper)
         
@@ -671,7 +673,7 @@ class Conv2dTransition(Transition):
         valid_ranges = {
             'weight': {
                 'min_channels': 1,
-                'max_channels': min(in_channels * 16, MAX_CHANNELS),  # Arbitrary reasonable limit
+                'max_channels': min(in_channels * 4, MAX_CHANNELS),  # Arbitrary reasonable limit
                 'kernel_sizes': [(k, k) for k in range(1, max_kernel+1)] # input is 224x224 --> 7*7
             },
             'stride': {
@@ -1404,34 +1406,51 @@ class TensorEvaluator(ProgramEvaluator):
         # 
         pass
 
+    @staticmethod
+    def _encode_tensor(tensor: torch.Tensor) -> Dict[str, Any]:
+        array = tensor.detach().cpu().contiguous().numpy()
+        return {
+            "__tensor__": True,
+            "shape": list(array.shape),
+            "dtype": array.dtype.str,
+            "data_b64": base64.b64encode(array.tobytes()).decode("ascii"),
+        }
+
+    @classmethod
+    def _decode_tensor(cls, payload: Dict[str, Any]) -> torch.Tensor:
+        raw_bytes = base64.b64decode(payload["data_b64"])
+        array = np.frombuffer(raw_bytes, dtype=np.dtype(payload["dtype"])).reshape(payload["shape"])
+        return torch.from_numpy(array.copy())
+
+    @classmethod
+    def _serialize_value(cls, obj: Any) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return cls._encode_tensor(obj)
+        if isinstance(obj, dict):
+            return {k: cls._serialize_value(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [cls._serialize_value(item) for item in obj]
+        return obj
+
+    @classmethod
+    def _deserialize_value(cls, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            if obj.get("__tensor__") is True:
+                return cls._decode_tensor(obj)
+            return {k: cls._deserialize_value(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [cls._deserialize_value(item) for item in obj]
+        return obj
+
 
     def store(self, file_path: str):
-        """Save test cases to disk. Handles torch tensors by converting them to lists."""
-        
-        def tensor_to_list(obj, level=0):
-            if level > 2:
-                return obj
-            if isinstance(obj, torch.Tensor):
-                return obj.tolist()
-            elif isinstance(obj, dict):
-                return {k: tensor_to_list(v) for k, v in obj.items()}
-            elif isinstance(obj, list) or isinstance(obj, tuple):
-                result = []
-                for item in obj:
-                    if isinstance(item, torch.Tensor):
-                        result.append(item.tolist())
-                    else:
-                        # Only one level of list is supported.
-                        result.append(tensor_to_list(item, level+1))
-                return result
-                #return [tensor_to_list(item) for item in obj]
-            return obj
+        """Save test cases to disk using compact, exact tensor encoding."""
 
         # Convert test cases to serializable format
         serializable_test_cases = []
         for test_case in self.test_cases:
             serializable_case = {
-                "result": tensor_to_list(test_case["result"]),
+                "result": self._serialize_value(test_case["result"]),
                 "state_oracle": test_case["state_oracle"],
                 "program_info": {
                     "init_local_str": test_case["program_info"]["init_local_str"],
@@ -1439,7 +1458,7 @@ class TensorEvaluator(ProgramEvaluator):
                     "init_implicit_dict": None, # not necessary for this evaluator
                     "end_implict_list": None, # not necessary for this evaluator
                     "init_load_str": test_case["program_info"]["init_load_str"],
-                    "init_load_info": tensor_to_list(test_case["program_info"]["init_load_info"])
+                    "init_load_info": self._serialize_value(test_case["program_info"]["init_load_info"])
                 },
                 "program": test_case["program"]
             }
@@ -1455,7 +1474,7 @@ class TensorEvaluator(ProgramEvaluator):
             
     @classmethod
     def load(cls, file_path: Union[str, Dict[str, Any], Mapping], config: Dict[str, Any] = None):
-        """Load test cases from disk. Converts lists back to torch tensors."""
+        """Load test cases from disk, supporting both old list and new byte formats."""
         if isinstance(file_path, Mapping):
             saved_info = dict(file_path)
         elif isinstance(file_path, str):
@@ -1475,16 +1494,17 @@ class TensorEvaluator(ProgramEvaluator):
         
         # Convert test cases back to tensor format
         for test_case in test_cases:
-            if isinstance(test_case["result"], int) or isinstance(test_case["result"], float):
-                result = test_case["result"]
-            else:
-                result = torch.tensor(test_case["result"])
+            result = cls._deserialize_value(test_case["result"])
+            if isinstance(result, list):
+                result = torch.tensor(result)
             init_load_info = []
-            for (name, value) in test_case["program_info"]["init_load_info"]:
+            for (name, value) in cls._deserialize_value(test_case["program_info"]["init_load_info"]):
                 if isinstance(value, int) or isinstance(value, float):
                     init_load_info.append((name, value))
                 else:
-                    init_load_info.append((name, torch.tensor(value)))
+                    if isinstance(value, list):
+                        value = torch.tensor(value)
+                    init_load_info.append((name, value))
             converted_case = {
                 "result": result,
                 "state_oracle": test_case["state_oracle"],
