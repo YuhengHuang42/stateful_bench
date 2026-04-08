@@ -81,6 +81,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 DEFAULT_MODIFICATION_RATIO = 0.3
 FIX_MAX_TOKENS = 16384
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -176,6 +177,17 @@ You are restricted to the following operations, prioritizing addition over delet
 2. Reorder code blocks: Fix context whiplash and group related operations logically without removing the underlying API calls.
 3. Modify branching: Adjust if-conditions to ensure logical execution flow based on state variables.
 4. Delete redundant/dead-state APIs: (LAST RESORT) You may delete an API call ONLY when necessary.
+"""
+
+ROUND_3_REPAIR_PROMPT = """The following program raised a runtime error. Fix it with minimal changes.
+
+## Program:
+{modified_program}
+
+## Error:
+{error_message}
+
+Return ONLY the fixed program. No explanation, no markdown fences.
 """
 
 
@@ -573,6 +585,49 @@ def _fix_program_with_small_llm(
         temperature=fix_temperature,
     )
     return _strip_code_fences(fixed_text), usage
+
+
+def _repair_program_with_llm(
+    modified_program: str,
+    error_message: str,
+    task_context: Dict[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Round 3: ask the same LLM to fix a runtime error in the modified program.
+
+    Returns ``(repaired_program, usage_dict)`` on success, or ``None`` when
+    the required config keys are missing.
+    """
+    base_url = task_context.get("base_url")
+    api_key = task_context.get("api_key")
+    model = task_context.get("model")
+    if not base_url or not model:
+        logger.warning("Round 3 repair skipped: base_url or model not set in task_context.")
+        return None
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    max_tokens = task_context.get("round3_max_tokens", task_context.get("round2_max_tokens", 32768))
+    temperature = task_context.get("temperature", 1)
+
+    prompt = ROUND_3_REPAIR_PROMPT.format(
+        modified_program=modified_program,
+        error_message=error_message,
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert Python programmer. "
+                "Fix the given program so it runs without error. "
+                "Return only the fixed code, no markdown fences."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    logger.info(f"Round 3 repair: asking {model} to fix runtime error: {error_message!r}")
+    raw_text, usage = _call_llm(client, model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+    repaired = _strip_code_fences(raw_text)
+    return repaired, usage
 
 
 def _build_round1_user_content(
@@ -1512,6 +1567,39 @@ def generate_and_collect_with_llm(
     # ── Step 2: Build program_info ────────────────────────────────────
     program_info = _build_program_info(result)
 
+    # ── Step 2.5: Pre-LLM collect/evaluate gate ───────────────────────
+    # If the original generated program cannot even produce/evaluate a
+    # valid first test case, skip LLM rewriting for this round.
+    pre_llm_evaluator = evaluator_class(evaluation_config)
+    try:
+        pre_llm_cases = pre_llm_evaluator.collect_test_case(
+            program_info=program_info,
+            program=result["program"],
+        )
+        if pre_llm_cases is None:
+            return _fail(
+                evaluator=pre_llm_evaluator,
+                error_msg=(
+                    "Pre-LLM collect_test_case failed on original program; "
+                    "skip this round."
+                ),
+            )
+        pre_pass_list, pre_test_detail = pre_llm_evaluator.evaluate(result["program"])
+        if (not pre_pass_list) or (pre_pass_list[0] is not True):
+            return _fail(
+                evaluator=pre_llm_evaluator,
+                error_msg=(
+                    "Pre-LLM evaluation failed on original program: "
+                    f"{pre_test_detail[0] if pre_test_detail else 'no detail'}; "
+                    "skip this round."
+                ),
+            )
+    except Exception as e:
+        return _fail(
+            evaluator=pre_llm_evaluator,
+            error_msg=f"Pre-LLM collect/evaluate crashed: {e}; skip this round.",
+        )
+
     # ── Step 3: LLM modifies the program ──────────────────────────────
     try:
         llm_result = llm_modify_fn(
@@ -1589,36 +1677,97 @@ def generate_and_collect_with_llm(
         else program_info
     )
 
+    def _run_collect_and_evaluate(prog: str) -> Tuple[object, list, list]:
+        """Create a fresh evaluator, collect one test case, evaluate, return (evaluator, pass_list, test_detail)."""
+        ev = evaluator_class(evaluation_config)
+        tc = ev.collect_test_case(program_info=effective_program_info, program=prog)
+        if tc is None:
+            raise RuntimeError("collect_test_case returned None")
+        pl, td = ev.evaluate(prog)
+        assert pl[0] is True, (
+            f"Evaluation failed on first test case: {td[0] if td else 'no detail'}"
+        )
+        return ev, pl, td
+
     evaluator = evaluator_class(evaluation_config)
     try:
-        test_cases = evaluator.collect_test_case(
-            program_info=effective_program_info,
-            program=modified_program,
-        )
-        if test_cases is None:
+        evaluator, pass_list, test_detail = _run_collect_and_evaluate(modified_program)
+    except Exception as e:
+        first_error = str(e)
+        if first_error.startswith("Evaluation failed on first test case"):
             return _fail(
-                llm_result=llm_result,
-                error_msg="collect_test_case returned None",
+                evaluator=evaluator, llm_result=llm_result,
+                error_msg=f"Test case collection/evaluation failed: {first_error}",
+            )
+        logger.warning(
+            f"Test case collection/evaluation failed: {first_error}. "
+            "Attempting Round 3 repair…"
+        )
+        repair_result = _repair_program_with_llm(
+            modified_program=modified_program,
+            error_message=first_error,
+            task_context=llm_context or {},
+        )
+        if repair_result is None:
+            return _fail(
+                evaluator=evaluator, llm_result=llm_result,
+                error_msg=f"Test case collection/evaluation failed: {first_error}",
+            )
+        repaired_program, repair_usage = repair_result
+        repaired_program = _fix_code_indentation(repaired_program)
+        llm_result.modified_program = repaired_program
+        modified_program = repaired_program
+
+        # Re-run post-check and refresh api_delta against the repaired program.
+        repaired_check = post_check_llm_modification(
+            original_program=result["program"],
+            modified_program=repaired_program,
+            program_info=program_info,
+            max_api_modifications=max_api_mods,
+            api_allowlist=_allowlist,
+        )
+        llm_result.llm_metadata["api_delta"] = {
+            "delta": repaired_check.api_delta,
+            "max_allowed": repaired_check.max_allowed_delta,
+            "original_total": repaired_check.api_count_original,
+            "modified_total": repaired_check.api_count_modified,
+            "original_by_type": repaired_check.api_counts_by_type_original,
+            "modified_by_type": repaired_check.api_counts_by_type_modified,
+        }
+        if not repaired_check.passed:
+            logger.warning(
+                f"Post-check failed on Round 3 repaired program: {repaired_check.details}. "
+                "Proceeding since evaluation succeeded."
             )
 
-        pass_list, test_detail = evaluator.evaluate(modified_program)
-        assert pass_list[0] is True, (
-            f"Evaluation failed on first test case: {test_detail[0] if test_detail else 'no detail'}"
-        )
-    except Exception as e:
-        return _fail(
-            evaluator=evaluator, llm_result=llm_result,
-            error_msg=f"Test case collection/evaluation failed: {e}",
-        )
+        llm_result.llm_metadata["round3_repair"] = {
+            "used": True,
+            "usage": repair_usage,
+            "post_check_passed": repaired_check.passed,
+        }
+        logger.info("Round 3 repair complete; retrying evaluation.")
+        try:
+            evaluator, pass_list, test_detail = _run_collect_and_evaluate(modified_program)
+        except Exception as e2:
+            return _fail(
+                evaluator=evaluator, llm_result=llm_result,
+                error_msg=f"Test case collection/evaluation failed after Round 3 repair: {e2}",
+            )
 
     # ── Step 6: Reversed if-else branch (same as the original) ────────
     if result["condition_info"] is not None:
         try:
             init_local_info_new = copy.deepcopy(result["init_block"][1])
             match_idx = None
-            for match_idx, item in enumerate(init_local_info_new):
+            for idx, item in enumerate(init_local_info_new):
                 if item[0] == result["condition_info"]["if_condition_name"]:
+                    match_idx = idx
                     break
+            if match_idx is None:
+                raise ValueError(
+                    f"Condition variable '{result['condition_info']['if_condition_name']}' "
+                    f"not found in init_local_info after LLM modification."
+                )
             init_local_info_new[match_idx] = (
                 init_local_info_new[match_idx][0],
                 Schema.reverse_if_condition(init_local_info_new[match_idx][1]),
@@ -1635,8 +1784,11 @@ def generate_and_collect_with_llm(
                 program_info=reversed_program_info,
                 program=modified_program,
             )
-            pass_list, _ = evaluator.evaluate(modified_program)
-            assert pass_list[0] is True
+            pass_list, test_detail = evaluator.evaluate(modified_program)
+            assert pass_list[-1] is True, (
+                f"Reversed test case evaluation failed: "
+                f"{test_detail[-1] if test_detail else 'no detail'}"
+            )
         except Exception as e:
             logger.warning(
                 f"Error reversing if-condition after LLM modification: {e}, skip."
@@ -1822,7 +1974,7 @@ def main(
         logger.info("Coverage-guided trace generation is disabled.")
 
     max_consecutive_failures = generation_config.get(
-        "max_consecutive_failures", num_of_tests * 1.5,
+        "max_consecutive_failures", DEFAULT_MAX_CONSECUTIVE_FAILURES,
     )
     idx = 0
     consecutive_failures = 0
