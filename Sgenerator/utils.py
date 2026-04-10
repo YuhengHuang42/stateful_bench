@@ -2,6 +2,8 @@ from functools import reduce
 from operator import getitem
 import json
 import ast
+import os
+import warnings
 from typing import Dict, List, Tuple, Set, Any, Optional
 import inspect
 import sys
@@ -80,7 +82,8 @@ def generate_jsonl_for_openai(request_id_list,
                               output_path=None,
                               max_tokens=None, 
                               model_type="gpt-4.1", 
-                              url="/v1/chat/completions"):
+                              url="/v1/chat/completions",
+                              response_format=None):
     """
     Prepare input batch data for OPENAI API
     Args:
@@ -90,6 +93,7 @@ def generate_jsonl_for_openai(request_id_list,
         max_tokens: maximum tokens to generate
         model_type: model type of OPENAI API
         url: API endpoint
+        response_format: optional OpenAI ``response_format`` dict (e.g. json_schema)
     """
     assert len(request_id_list) == len(message_list)
     data = []
@@ -102,6 +106,8 @@ def generate_jsonl_for_openai(request_id_list,
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        if response_format is not None:
+            body["response_format"] = response_format
         per_request = {
             "custom_id": request_id,
             "method": "POST",
@@ -890,4 +896,56 @@ def _extract_api_names_from_doc(doc_text: str) -> Set[str]:
     for method in http_methods:
         names.add(f"requests.{method}")
     return names
+
+
+# ---------------------------------------------------------------------------
+# Program intent summaries (LLM trace generation → translation generator)
+# ---------------------------------------------------------------------------
+
+
+def load_program_intent_summaries_index(trace_save_path: str) -> Dict[int, str]:
+    """Load per-trace intent summaries from ``<trace_save_path>/program_intent_summaries``.
+
+    Expected layout matches ``llm_trace_generation._save_program_intent_summaries``:
+    one JSON file per trace id, e.g. ``3.json`` with keys ``id``, ``source_round``,
+    ``summary``.
+
+    Returns
+    -------
+    dict[int, str]
+        Mapping from trace index to non-empty summary text. If the folder is
+        missing or not a directory, returns an empty dict.
+    """
+    summaries_dir = os.path.join(trace_save_path, "program_intent_summaries")
+    if not os.path.isdir(summaries_dir):
+        return {}
+
+    out: Dict[int, str] = {}
+    for name in os.listdir(summaries_dir):
+        if not name.endswith(".json"):
+            continue
+        stem = name[:-5]
+        try:
+            key = int(stem)
+        except ValueError:
+            warnings.warn(f"Skipping program_intent_summaries entry (bad name): {name!r}")
+            continue
+        path = os.path.join(summaries_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            warnings.warn(f"Skipping program_intent_summaries file {path!r}: {e}")
+            continue
+        if not isinstance(data, dict):
+            continue
+        trace_id = data.get("id", key)
+        try:
+            trace_id = int(trace_id)
+        except (TypeError, ValueError):
+            trace_id = key
+        summary = (data.get("summary") or "").strip()
+        if summary:
+            out[trace_id] = summary
+    return out
 

@@ -6,7 +6,6 @@ from enum import Enum
 from faker import Faker
 import random
 from loguru import logger
-import traceback
 import json
 
 from Sgenerator.utils import get_nested_path_string
@@ -1613,8 +1612,11 @@ class VoiceEvaluator(ProgramEvaluator):
         try:
             exec(complete_program, namespace)
         except Exception as e:
-            error_info = traceback.format_exc()
-            logger.warning(f"Error in executing the program: {error_info}")
+            error_info = self._log_exec_error(
+                stage="collect_test_case.exec_program",
+                error=e,
+                program=complete_program,
+            )
             return None
         
         if f"{RESULT_NAME}" in namespace:
@@ -1659,7 +1661,12 @@ class VoiceEvaluator(ProgramEvaluator):
             try:
                 exec(complete_program, namespace)
             except Exception as e:
-                error_info = traceback.format_exc()
+                error_info = self._log_exec_error(
+                    stage="evaluate.exec_program",
+                    error=e,
+                    program=complete_program,
+                    test_idx=test_idx,
+                )
                 pass_list.append(False)
                 test_case_pass_detail.append({
                     "result_pass": False,

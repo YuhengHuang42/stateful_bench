@@ -20,14 +20,17 @@ Flow
    pairwise transition counts.
 4. **LLM Round 1 (Analysis)** — the program, transition chains, API
    documentation, and initialisation context are sent to the LLM in a
-   structured prompt.  The LLM performs sub-intention mapping, an
+   structured prompt.  When ``use_api_structured_output`` is enabled
+   (default), the chat API uses ``response_format`` JSON schema for
+   ``Round1Response``.  The LLM performs sub-intention mapping, an
    unnaturalness audit, and returns a binary modification label
    (0 = keep, 1 = modify).
 5. **LLM Round 2 (Modification)** — if the label is 1, a follow-up
    message is appended to the same multi-turn conversation asking the
    LLM to refactor the code under strict constraints (immutable init
    variables, bounded API-count delta, transition-pair preservation).
-   The LLM returns the modified program body.
+   Structured output uses ``Round2Response`` schema when enabled.
+   The LLM returns the modified program body in the structured fields.
 6. **Post-check** — the modified program is validated: the absolute
    change in *documented* API call count (per the allowlist) must not
    exceed ``max_api_modifications`` (derived from a configurable
@@ -76,6 +79,11 @@ from Sgenerator.state import (
     generate_program,
 )
 from Sgenerator import utils
+from Sgenerator.agent import (
+    _extract_json_from_response as _extract_json_object_from_llm_text,
+    _flatten_system_messages_for_chat_api,
+    openai_json_schema_response_format,
+)
 from Sgenerator.utils import _extract_api_names_from_doc
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -153,6 +161,11 @@ Based on your audit, assign a binary label:
 
 0: The code is human-like, cohesive, and requires no modification.
 1: The code exhibits unnaturalness and requires modification.
+
+## Task 4: Overall Program Intent Summary (conditional)
+If your Task 3 label is 0, provide a short 1-2 sentence summary of the
+overall program intent by composing all sub-intents.
+If your Task 3 label is 1, leave this summary empty.
 """
 
 ROUND_2_PROMPT = """
@@ -169,6 +182,8 @@ Objective: Improve the original code snippet to make it human-readable and logic
 4. Syntactic Validity & Indentation: The resulting code MUST have perfectly valid Python syntax. You must ensure rigorous and consistent indentation. Pay strict attention to colons, closed parentheses, and the alignment of if/else and try/except blocks.
 5. If there is a RESULT variable as the sink variable, the generated code should also have that variable as the sink variable.
 6. Please maintain similar length of the generated code as the original code.
+7. Also provide a short 1-2 sentence summary of the final modified program's
+   overall intent by composing all sub-intents.
 
 ## Permitted Actions (In Order of Preference):
 You are restricted to the following operations, prioritizing addition over deletion:
@@ -186,6 +201,9 @@ ROUND_3_REPAIR_PROMPT = """The following program raised a runtime error. Fix it 
 
 ## Error:
 {error_message}
+
+## Failing Line (if available):
+{line_content}
 
 Return ONLY the fixed program. No explanation, no markdown fences.
 """
@@ -244,6 +262,13 @@ class Round1Response(BaseModel):
         default="",
         description="Brief justification for the label."
     )
+    overall_program_intent_summary: str = Field(
+        default="",
+        description=(
+            "If modification_label=0, provide a short overall intent summary. "
+            "If modification_label=1, keep empty."
+        ),
+    )
 
 
 class Round2Response(BaseModel):
@@ -255,6 +280,62 @@ class Round2Response(BaseModel):
         default="",
         description="Brief summary of what was changed and why."
     )
+    overall_program_intent_summary: str = Field(
+        default="",
+        description=(
+            "Short 1-2 sentence summary of the final modified program intent."
+        ),
+    )
+
+
+ROUND1_RESPONSE_JSON_KEYS = frozenset(
+    {"modification_label", "sub_intention_mapping"}
+)
+ROUND2_RESPONSE_JSON_KEYS = frozenset({"modified_program"})
+
+STRUCTURED_API_ROUND1_PROMPT_TAIL = (
+    "\n\nThe API enforces the response shape: a JSON object with fields "
+    "``sub_intention_mapping``, ``unnaturalness_issues``, ``modification_label``, "
+    "``reasoning``, and ``overall_program_intent_summary`` (see schema). "
+    "Do not echo the schema text in your reply.\n"
+)
+
+STRUCTURED_API_ROUND2_PROMPT_TAIL = (
+    "\n\nThe API enforces the response shape: a JSON object with fields "
+    "``modified_program``, ``change_summary``, and ``overall_program_intent_summary``. "
+    "Do not echo the schema text in your reply.\n"
+)
+
+
+def _parse_round1_response_text(
+    text: str,
+    *,
+    use_api_structured_output: bool = False,
+) -> Round1Response:
+    if use_api_structured_output:
+        try:
+            return Round1Response.model_validate_json(text.strip())
+        except Exception:
+            pass
+    return Round1Response.model_validate(
+        _extract_json_object_from_llm_text(text, ROUND1_RESPONSE_JSON_KEYS)
+    )
+
+
+def _parse_round2_response_text(
+    text: str,
+    *,
+    use_api_structured_output: bool = False,
+) -> Round2Response:
+    if use_api_structured_output:
+        try:
+            return Round2Response.model_validate_json(text.strip())
+        except Exception:
+            pass
+    return Round2Response.model_validate(
+        _extract_json_object_from_llm_text(text, ROUND2_RESPONSE_JSON_KEYS)
+    )
+
 
 # ---------------------------------------------------------------------------
 # LLM helpers
@@ -314,37 +395,6 @@ def _format_program_info_as_example_input(program_info: Dict[str, Any]) -> str:
     #        f"{json.dumps(summarised, indent=2, default=str)}"
     #    )
     return "\n\n".join(parts) if parts else "(no example input)"
-
-
-def _extract_json_from_response(text: str) -> dict:
-    """Best-effort extraction of a JSON object from LLM text.
-
-    Tries (in order):
-    1. Direct ``json.loads`` on the full text.
-    2. First ```json ... ``` fenced block.
-    3. First ``{ ... }`` substring (greedy outermost braces).
-    """
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(f"Could not extract JSON from LLM response:\n{text[:500]}")
 
 
 def _fix_code_indentation(code: str) -> str:
@@ -477,29 +527,40 @@ def _call_llm(
     messages: List[Dict[str, Any]],
     max_tokens: int = 16384,
     temperature: float = 1.0,
+    response_format: Optional[dict] = None,
 ) -> Tuple[str, dict]:
     """Fire a single chat-completion request and return (text, usage_dict).
 
     *messages* is the full conversation list (system + user + assistant + …).
+    When *response_format* is set (e.g. OpenAI ``json_schema`` mode), the API
+    should return a single JSON object; see ``openai_json_schema_response_format``.
+
+    Messages are passed through ``_flatten_system_messages_for_chat_api`` for
+    compatibility with gateways that require a user turn after system prompts.
+
     Raises on HTTP / API errors so the caller can handle retries.
     Raises ``ValueError`` when the response is truncated (``finish_reason
     == "length"``).
     """
+    api_messages = _flatten_system_messages_for_chat_api(messages)
     approx_chars = sum(
         len(m.get("content", "") if isinstance(m.get("content"), str)
             else "".join(b.get("text", "") for b in m.get("content", []) if isinstance(b, dict)))
-        for m in messages
+        for m in api_messages
     )
     logger.debug(
         f"LLM call: ~{approx_chars} prompt char, max_tokens={max_tokens}"
     )
     t0 = time.time()
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": api_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    response = client.chat.completions.create(**kwargs)
     elapsed = time.time() - t0
     choice = response.choices[0]
     text = choice.message.content or ""
@@ -590,6 +651,7 @@ def _fix_program_with_small_llm(
 def _repair_program_with_llm(
     modified_program: str,
     error_message: str,
+    line_content: Optional[str],
     task_context: Dict[str, Any],
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Round 3: ask the same LLM to fix a runtime error in the modified program.
@@ -611,6 +673,7 @@ def _repair_program_with_llm(
     prompt = ROUND_3_REPAIR_PROMPT.format(
         modified_program=modified_program,
         error_message=error_message,
+        line_content=line_content if line_content else "(not available)",
     )
     messages = [
         {
@@ -624,7 +687,10 @@ def _repair_program_with_llm(
         {"role": "user", "content": prompt},
     ]
 
-    logger.info(f"Round 3 repair: asking {model} to fix runtime error: {error_message!r}")
+    logger.info(
+        f"Round 3 repair: asking {model} to fix runtime error: {error_message!r}, "
+        f"line_content={line_content!r}"
+    )
     raw_text, usage = _call_llm(client, model, messages=messages, max_tokens=max_tokens, temperature=temperature)
     repaired = _strip_code_fences(raw_text)
     return repaired, usage
@@ -635,7 +701,8 @@ def _build_round1_user_content(
     program_info: Dict[str, Any],
     transition_chains: List[List[str]],
     api_documentation: str,
-    response_schema_json: str,
+    *,
+    use_api_structured_output: bool = False,
 ) -> str:
     """Assemble the user message for Round 1."""
     example_input = _format_program_info_as_example_input(program_info)
@@ -647,7 +714,11 @@ def _build_round1_user_content(
         api_documentation=api_documentation,
         example_input=example_input,
     )
-    filled += _JSON_OUTPUT_INSTRUCTION + response_schema_json
+    if use_api_structured_output:
+        filled += STRUCTURED_API_ROUND1_PROMPT_TAIL
+    else:
+        schema_json = _compact_schema(Round1Response.model_json_schema())
+        filled += _JSON_OUTPUT_INSTRUCTION + schema_json
     return filled
 
 
@@ -664,9 +735,10 @@ def _format_pair_transitions(
 
 
 def _build_round2_followup(
-    response_schema_json: str,
     max_api_modifications: int,
     pair_transition_str: str,
+    *,
+    use_api_structured_output: bool = False,
 ) -> str:
     """Build the Round 2 follow-up user message.
 
@@ -679,7 +751,10 @@ def _build_round2_followup(
         max_api_modifications=max_api_modifications,
         pair_transition=pair_transition_str,
     )
-    return filled + _JSON_OUTPUT_INSTRUCTION + response_schema_json
+    if use_api_structured_output:
+        return filled + STRUCTURED_API_ROUND2_PROMPT_TAIL
+    schema_json = _compact_schema(Round2Response.model_json_schema())
+    return filled + _JSON_OUTPUT_INSTRUCTION + schema_json
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +780,7 @@ def llm_modify_program(
             "api_documentation": "...",                      # optional
             "max_retries": 2,                                # optional
             "temperature": 0.3,                              # optional
+            "use_api_structured_output": True,               # optional; json_schema + validate
         }
 
     All original inputs are deep-copied before use so the LLM logic
@@ -724,15 +800,27 @@ def llm_modify_program(
     max_retries = task_context.get("max_retries", 2)
     temperature = task_context.get("temperature", 1)
     api_allowlist: Optional[Set[str]] = task_context.get("api_allowlist")
+    use_api_structured_output = bool(
+        task_context.get("use_api_structured_output", True)
+    )
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
-    round1_schema_json = json.dumps(Round1Response.model_json_schema(), indent=2)
-    round2_schema_json = json.dumps(Round2Response.model_json_schema(), indent=2)
+    rf_round1 = (
+        openai_json_schema_response_format(Round1Response, "llm_trace_round1")
+        if use_api_structured_output
+        else None
+    )
+    rf_round2 = (
+        openai_json_schema_response_format(Round2Response, "llm_trace_round2")
+        if use_api_structured_output
+        else None
+    )
 
     metadata: Dict[str, Any] = {
         "model": model,
         "input_program_raw": program,
+        "use_api_structured_output": use_api_structured_output,
     }
 
     # ── Extract transition chains from the original program ───────────
@@ -758,16 +846,24 @@ def llm_modify_program(
         "role": "system",
         "content": (
             "You are an expert Software Engineer specializing in code analysis "
-            "and refactoring. Always respond with valid JSON."
+            "and refactoring. "
+            + (
+                "The API returns a single JSON object matching the requested schema."
+                if use_api_structured_output
+                else "Always respond with valid JSON."
+            )
         ),
     }
     round1_user_text = _build_round1_user_content(
-        program, program_info, transition_chains,
-        api_documentation, round1_schema_json,
+        program,
+        program_info,
+        transition_chains,
+        api_documentation,
+        use_api_structured_output=use_api_structured_output,
     )
     conversation: List[Dict[str, Any]] = [
         system_msg,
-        {"role": "user", "content": [{"type": "text", "text": round1_user_text}]},
+        {"role": "user", "content": round1_user_text},
     ]
 
     # ── Round 1: Analysis ─────────────────────────────────────────────
@@ -777,16 +873,20 @@ def llm_modify_program(
     for attempt in range(1, max_retries + 1):
         try:
             raw_text, usage = _call_llm(
-                client, model,
+                client,
+                model,
                 messages=conversation,
                 max_tokens=round1_max_tokens,
                 temperature=temperature,
+                response_format=rf_round1,
             )
             round1_raw_text = raw_text
             metadata["round1_usage"] = usage
             metadata["round1_raw"] = raw_text
-            parsed_dict = _extract_json_from_response(raw_text)
-            round1_parsed = Round1Response.model_validate(parsed_dict)
+            round1_parsed = _parse_round1_response_text(
+                raw_text,
+                use_api_structured_output=use_api_structured_output,
+            )
             metadata["round1_parsed"] = round1_parsed.model_dump()
             break
         except Exception as e:
@@ -807,6 +907,10 @@ def llm_modify_program(
     # ── Short-circuit if label == 0 (no modification needed) ──────────
     if round1_parsed.modification_label == 0:
         logger.info("Round 1 label=0 → no modification, returning original program.")
+        metadata["program_intent_summary"] = {
+            "source_round": "round1",
+            "text": round1_parsed.overall_program_intent_summary.strip(),
+        }
         return LLMModificationResult(
             modified_program=program,
             llm_metadata=metadata,
@@ -825,14 +929,12 @@ def llm_modify_program(
 
     pair_transition_str = _format_pair_transitions(round_transitions)
     round2_followup = _build_round2_followup(
-        round2_schema_json,
         max_api_modifications=max_api_modifications,
         pair_transition_str=pair_transition_str,
+        use_api_structured_output=use_api_structured_output,
     )
     metadata["max_api_modifications"] = max_api_modifications
-    conversation.append(
-        {"role": "user", "content": [{"type": "text", "text": round2_followup}]},
-    )
+    conversation.append({"role": "user", "content": round2_followup})
 
     round2_max_tokens = task_context.get("round2_max_tokens", 32768)
 
@@ -840,15 +942,19 @@ def llm_modify_program(
     for attempt in range(1, max_retries + 1):
         try:
             raw_text, usage = _call_llm(
-                client, model,
+                client,
+                model,
                 messages=conversation,
                 max_tokens=round2_max_tokens,
                 temperature=temperature,
+                response_format=rf_round2,
             )
             metadata["round2_usage"] = usage
             metadata["round2_raw"] = raw_text
-            parsed_dict = _extract_json_from_response(raw_text)
-            round2_parsed = Round2Response.model_validate(parsed_dict)
+            round2_parsed = _parse_round2_response_text(
+                raw_text,
+                use_api_structured_output=use_api_structured_output,
+            )
             metadata["round2_parsed"] = round2_parsed.model_dump()
             break
         except Exception as e:
@@ -862,6 +968,10 @@ def llm_modify_program(
 
     assert round2_parsed is not None
     logger.info(f"Round 2 complete: {round2_parsed.change_summary}")
+    metadata["program_intent_summary"] = {
+        "source_round": "round2",
+        "text": round2_parsed.overall_program_intent_summary.strip(),
+    }
 
     # ── Diff transitions via static analysis ──────────────────────────
     modified_program = round2_parsed.modified_program
@@ -1086,6 +1196,32 @@ def _save_llm_logs(
     )
 
 
+def _save_program_intent_summaries(
+    llm_results_recorder: Dict[int, LLMModificationResult],
+    save_dir: str,
+) -> None:
+    """Persist per-case overall program intent summaries to local files."""
+    out_dir = os.path.join(save_dir, "program_intent_summaries")
+    os.makedirs(out_dir, exist_ok=True)
+    saved = 0
+    for idx, result in llm_results_recorder.items():
+        meta = result.llm_metadata or {}
+        summary_block = meta.get("program_intent_summary") or {}
+        summary_text = (summary_block.get("text") or "").strip()
+        if not summary_text:
+            continue
+        payload = {
+            "id": idx,
+            "source_round": summary_block.get("source_round"),
+            "summary": summary_text,
+        }
+        save_path = os.path.join(out_dir, f"{idx}.json")
+        with open(save_path, "w") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        saved += 1
+    logger.info(f"Program intent summaries saved to {out_dir}/ ({saved} cases).")
+
+
 def llm_modify_program_mock(
     program: str,
     program_info: Dict[str, Any],
@@ -1101,7 +1237,13 @@ def llm_modify_program_mock(
         modified_program=program,
         removed_transitions=[],
         added_transitions={},
-        llm_metadata={"placeholder": True},
+        llm_metadata={
+            "placeholder": True,
+            "program_intent_summary": {
+                "source_round": "mock",
+                "text": "",
+            },
+        },
     )
 
 
@@ -1703,9 +1845,16 @@ def generate_and_collect_with_llm(
             f"Test case collection/evaluation failed: {first_error}. "
             "Attempting Round 3 repair…"
         )
+        line_content = None
+        if getattr(e, "__cause__", None) is not None:
+            cause = e.__cause__
+            cause_line = getattr(cause, "line_content", None)
+            if isinstance(cause_line, str) and cause_line.strip():
+                line_content = cause_line
         repair_result = _repair_program_with_llm(
             modified_program=modified_program,
             error_message=first_error,
+            line_content=line_content,
             task_context=llm_context or {},
         )
         if repair_result is None:
@@ -1807,6 +1956,14 @@ app = typer.Typer(
     pretty_exceptions_short=False,
 )
 
+def _ensure_parent_dir(path_like: Any) -> None:
+    """Create parent directory for a file path if needed."""
+    if not path_like:
+        return
+    parent_dir = os.path.dirname(str(path_like))
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
 
 @app.command()
 def main(
@@ -1846,6 +2003,15 @@ def main(
 
     if trace_save_path is None:
         trace_save_path = config_dict["env"]["trace_save_path"]
+    os.makedirs(str(trace_save_path), exist_ok=True)
+
+    log_file_path = (
+        generation_config.get("log_file_path")
+        or config_dict.get("env", {}).get("log_file_path")
+        or os.environ.get("LOG_FILE_PATH")
+    )
+    if log_file_path:
+        _ensure_parent_dir(log_file_path)
 
     if occurence_book_path is None:
         occurence_book_path = os.path.join(
@@ -1906,7 +2072,8 @@ def main(
     if use_llm:
         logger.info(
             f"Using real LLM: model={llm_config['model']}, "
-            f"base_url={llm_config['base_url']}"
+            f"base_url={llm_config['base_url']}, "
+            f"use_api_structured_output={llm_config['use_api_structured_output']}"
         )
         if llm_config["enable_fix_llm"]:
             msg = (
@@ -1920,6 +2087,20 @@ def main(
     else:
         llm_config["modification_ratio"] = DEFAULT_MODIFICATION_RATIO
         logger.warning("Modification ratio not set, using default value {DEFAULT_MODIFICATION_RATIO}.")
+
+    uao_env = os.environ.get("LLM_TRACE_USE_API_STRUCTURED_OUTPUT")
+    if uao_env is not None and str(uao_env).strip():
+        use_api_structured_output = str(uao_env).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    else:
+        use_api_structured_output = bool(
+            generation_config.get("use_api_structured_output", True),
+        )
+    llm_config["use_api_structured_output"] = use_api_structured_output
 
     # -- Derive API allowlist from the documentation --
     api_allowlist = _extract_api_names_from_doc(api_documentation)
@@ -2054,6 +2235,7 @@ def main(
 
     # -- Save LLM call logs and statistics --
     _save_llm_logs(llm_results_recorder, str(trace_save_path))
+    _save_program_intent_summaries(llm_results_recorder, str(trace_save_path))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from collections import defaultdict
 from collections import OrderedDict
 import requests
 import json
-import traceback
 
 from Sgenerator.utils import get_nested_path_string
 from Sgenerator.state import State, Transition, Schema, RandomInitializer, USER_FUNCTION_PARAM_FLAG, RESPONSE_VARIABLE_TEMP
@@ -1949,7 +1948,12 @@ class SessionEvaluator(ProgramEvaluator):
             try:
                 exec(complete_program, namespace)
             except Exception as e:
-                error_info = traceback.format_exc()
+                error_info = self._log_exec_error(
+                    stage="evaluate.exec_program",
+                    error=e,
+                    program=complete_program,
+                    test_idx=idx,
+                )
                 pass_list.append(False)
                 test_case_pass_detail.append({
                     "result_pass": False,
@@ -1979,7 +1983,12 @@ class SessionEvaluator(ProgramEvaluator):
                     if test_case["result"] is not None:
                         result_pass = False
             except Exception as e:
-                error_info = traceback.format_exc()
+                error_info = self._log_exec_error(
+                    stage="evaluate.compare_result",
+                    error=e,
+                    program=complete_program,
+                    test_idx=idx,
+                )
                 pass_list.append(False)
                 test_case_pass_detail.append({
                     "result_pass": False,

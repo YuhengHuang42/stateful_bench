@@ -15,6 +15,7 @@ import copy
 import os
 import json
 import filelock
+import traceback
 from pathlib import Path
 from . import utils
 
@@ -897,6 +898,36 @@ class TraceGenerator:
 
 class ProgramEvaluator(ABC):
     """Base class for program evaluators defining common interface"""
+
+    @staticmethod
+    def _summarize_exec_error(error: Exception, program: Optional[str] = None) -> Dict[str, Any]:
+        """Build a structured error report with line-level program context."""
+        tb_entries = traceback.extract_tb(error.__traceback__)
+        final_frame = tb_entries[-1] if tb_entries else None
+        line_number = final_frame.lineno if final_frame is not None else None
+        source_line = final_frame.line if final_frame is not None else None
+        if program is not None and line_number is not None:
+            program_lines = program.splitlines()
+            if 1 <= line_number <= len(program_lines):
+                source_line = program_lines[line_number - 1]
+        return {
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "line_number": line_number,
+            "line_content": source_line,
+            "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+        }
+
+    def _log_exec_error(self, stage: str, error: Exception, program: Optional[str] = None, test_idx: Optional[int] = None):
+        """Log execution failures with precise line context for debugging."""
+        report = self._summarize_exec_error(error, program)
+        test_case_info = f", test_case_idx={test_idx}" if test_idx is not None else ""
+        logger.warning(
+            f"[{self.__class__.__name__}] stage={stage}{test_case_info}, "
+            f"error={report['error_type']}: {report['error_message']}, "
+            f"line={report['line_number']}, code={report['line_content']!r}"
+        )
+        return report
     
     @classmethod
     @abstractmethod

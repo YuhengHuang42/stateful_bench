@@ -12,7 +12,6 @@ from collections import defaultdict
 from collections import OrderedDict
 import requests
 import json
-import traceback
 import numpy as np
 import torch
 
@@ -1535,8 +1534,11 @@ class TensorEvaluator(ProgramEvaluator):
         try:
             exec(complete_program, namespace)
         except Exception as e:
-            error_info = traceback.format_exc()
-            logger.warning(f"Error in executing the program: {error_info}")
+            error_info = self._log_exec_error(
+                stage="collect_test_case.exec_program",
+                error=e,
+                program=complete_program,
+            )
             return None
         
         if f"{RESULT_NAME}" in namespace:
@@ -1569,7 +1571,11 @@ class TensorEvaluator(ProgramEvaluator):
             try:
                 exec(complete_program, namespace)
             except Exception as e:
-                error_info = traceback.format_exc()
+                error_info = self._log_exec_error(
+                    stage="evaluate.exec_program",
+                    error=e,
+                    program=complete_program,
+                )
                 pass_list.append(False)
                 test_case_pass_detail.append({
                     "result_pass": False,
@@ -1603,7 +1609,11 @@ class TensorEvaluator(ProgramEvaluator):
                     if test_case["result"] is not None:
                         result_pass = False
             except Exception as e:
-                error_info = traceback.format_exc()
+                error_info = self._log_exec_error(
+                    stage="evaluate.compare_result",
+                    error=e,
+                    program=complete_program,
+                )
                 pass_list.append(False)
                 test_case_pass_detail.append({
                     "result_pass": False,
