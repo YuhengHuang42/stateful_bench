@@ -3,7 +3,7 @@ This script is used to evaluate the LLM performance on the (local version of) st
 """
 import typer
 from Sgenerator.state import StateEval
-from typing import Annotated
+from typing import Annotated, Optional, Union
 from pathlib import Path
 import yaml
 from loguru import logger
@@ -13,12 +13,20 @@ import traceback
 import pickle
 import os
 from tqdm import tqdm
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
 # StateEval: parent_path: str, task: str, config_dict: dict, api_doc: str
 
 from Sgenerator.utils import generate_jsonl_for_openai, submit_batch_request_openai
 
 
 app = typer.Typer(pretty_exceptions_show_locals=False, pretty_exceptions_short=False)
+PROJECT_ROOT = Path(__file__).resolve().parent
+if load_dotenv:
+    load_dotenv(PROJECT_ROOT / ".env")
 
 def wait_for_batch_completion(client, batch_id, wait_time=10):
     """Poll batch status until completion"""
@@ -28,6 +36,59 @@ def wait_for_batch_completion(client, batch_id, wait_time=10):
         if batch_status.status in ['completed', 'failed', 'cancelled']:
             return
         time.sleep(wait_time)  # Check every 10 seconds
+
+
+def _resolve_eval_batch_mode(env_config: dict, cli_batch_mode: Optional[bool]) -> bool:
+    if cli_batch_mode is not None:
+        return cli_batch_mode
+    batch_mode_env = os.environ.get("LLM_EVAL_BATCH_MODE")
+    if batch_mode_env is not None and str(batch_mode_env).strip():
+        return str(batch_mode_env).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    return bool(env_config.get("eval_batch_mode", True))
+
+
+def _resolve_openai_compat_credentials(env_config: dict, cli_base_url: Optional[str]):
+    base_url = cli_base_url
+    if base_url is None:
+        base_url = os.environ.get("BASE_URL") or env_config.get("open_source_base_url")
+    if base_url is not None and str(base_url).strip() == "":
+        base_url = None
+    api_key = (
+        os.environ.get("API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or env_config.get("openai_api_key", "")
+    )
+    return base_url, api_key
+
+
+def _safe_artifact_tag(model: str) -> str:
+    """Model ids may contain slashes (e.g. provider/model); strip for filesystem-safe filenames."""
+    s = model.strip()
+    for ch in ("/", "\\", "\x00"):
+        s = s.replace(ch, "_")
+    return s or "model"
+
+
+def _ensure_parent_dir(path: Union[str, os.PathLike]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _openai_batch_supported(base_url: Optional[str]) -> bool:
+    """
+    OpenAI Batch + Files APIs exist only on the official host. Most OpenAI-compatible
+    servers (custom base_url) implement chat completions only and return 404 on batch.
+    """
+    if base_url is None:
+        return True
+    u = base_url.strip().rstrip("/").lower()
+    return u in ("https://api.openai.com/v1", "http://api.openai.com/v1")
+
 
 def extract_code(text: str) -> str:
     """
@@ -66,14 +127,34 @@ def main(
     result_dir: Annotated[Path, typer.Option()] = None,
     openai_url: Annotated[str, typer.Option()] = "/v1/chat/completions",
     first_n: Annotated[int, typer.Option()] = -1,
+    base_url: Annotated[
+        Optional[str],
+        typer.Option(help="OpenAI-compatible API base (e.g. https://api.openai.com/v1). Overrides BASE_URL / config env.open_source_base_url."),
+    ] = None,
+    batch_mode: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--batch/--no-batch",
+            help="Use OpenAI Batch API (only on api.openai.com). Use --no-batch for chat completions (vLLM, etc.). Overrides LLM_EVAL_BATCH_MODE / env.eval_batch_mode.",
+        ),
+    ] = None,
+    max_tokens: Annotated[
+        Optional[int],
+        typer.Option(help="Max completion tokens for chat (non-batch) OpenAI-compatible calls."),
+    ] = 8192,
 ):
     with open(config_file, 'r') as file:
         config_dict = yaml.safe_load(file)
     with open(api_doc_file, 'r') as file:
         api_doc = file.read()
+    env_config = config_dict.get("env", {})
     if parent_path is None:
         parent_path = config_dict["env"]["trace_save_path"]
-    
+    if result_dir is not None:
+        Path(result_dir).expanduser().mkdir(parents=True, exist_ok=True)
+
+    artifact_tag = _safe_artifact_tag(target_llm)
+
     logger.info(f"Evaluating {config_dict['task']} with {api_doc_file}, Loading StateEval...")
     stateful_bench = StateEval(parent_path, config_dict["task"], config_dict, api_doc)
     logger.info(f"StateEval loaded, {len(stateful_bench)} test cases in total.")
@@ -87,8 +168,34 @@ def main(
     code_message_list = []
     message_list = []
     if "gpt" in target_llm:
-        # OPENAI mode
-        # Generate OpenAI batch requests
+        # OPENAI-compatible mode (official OpenAI Batch API or per-request chat.completions)
+        compat_base, compat_api_key = _resolve_openai_compat_credentials(env_config, base_url)
+        eval_batch_mode = _resolve_eval_batch_mode(env_config, batch_mode)
+        chat_max_tokens = max_tokens
+        if chat_max_tokens is None:
+            te = os.environ.get("LLM_EVAL_MAX_TOKENS")
+            if te is not None and str(te).strip():
+                chat_max_tokens = int(te)
+            else:
+                chat_max_tokens = int(env_config.get("eval_max_tokens", 4096))
+        if not compat_api_key:
+            raise ValueError(
+                "Missing API key for OpenAI-compatible evaluation. Set API_KEY/OPENAI_API_KEY "
+                "or env.openai_api_key in config."
+            )
+        client = openai.OpenAI(api_key=compat_api_key, base_url=compat_base)
+        if eval_batch_mode and not _openai_batch_supported(compat_base):
+            logger.warning(
+                "Batch mode was requested but base_url is not https://api.openai.com/v1; "
+                "OpenAI Batch API is unavailable on this host. Using chat completions instead "
+                "(set --no-batch explicitly to silence this)."
+            )
+            eval_batch_mode = False
+        logger.info(
+            f"OpenAI-compatible eval: base_url={compat_base or '[default OpenAI]'}, "
+            f"batch_mode={eval_batch_mode}, max_tokens={chat_max_tokens}"
+        )
+
         request_id_list = []
         for idx, prompt in enumerate(stateful_bench):
             if idx >= first_n and first_n > 0:
@@ -99,47 +206,80 @@ def main(
                 "content": prompt
             }])
             prompt_message_list.append(prompt)
-        jsonl_path = os.path.join(result_dir, "openai_requests.jsonl")
-        generate_jsonl_for_openai(
-            request_id_list=request_id_list,
-            message_list=message_list,
-            output_path=jsonl_path,
-            model_type=target_llm
-        )
-        
-        # Initialize OpenAI client and submit batch
-        client = openai.OpenAI(api_key=config_dict["env"]["openai_api_key"])
-        batch_submit_info, batch_result_info = submit_batch_request_openai(
-            client=client,
-            input_file_path=jsonl_path,
-            url=openai_url,
-            description=f"benchmark {config_dict['task']} for {target_llm}",
-        )
-        
-        logger.info(f"Batch submitted, waiting for completion...")
-        wait_for_batch_completion(client, batch_submit_info.id)
-        batch_result_info = client.batches.retrieve(batch_submit_info.id)
-        file_response = client.files.content(batch_result_info.output_file_id)
-        
-        raw_message_list = []
-        for i in file_response.iter_lines():
-            info = json.loads(i)
-            raw_message_list.append(info)
-            code = extract_code(info["response"]["body"]["choices"][0]["message"]["content"])
-            custom_id = info["custom_id"]
-            item_id = int(custom_id.split("_")[1])
-            code_message_list.append({
-                "item_id": item_id,
-                "code": code
-            })
-        
-        result = {
-            "raw_message_list": raw_message_list,
-            "code_message_list": code_message_list,
-            "batch_submit_info": batch_submit_info,
-            "batch_result_info": batch_result_info,
-            "prompt_message_list": prompt_message_list
-        }
+
+        if eval_batch_mode:
+            jsonl_path = os.path.join(result_dir, "openai_requests.jsonl")
+            _ensure_parent_dir(jsonl_path)
+            generate_jsonl_for_openai(
+                request_id_list=request_id_list,
+                message_list=message_list,
+                output_path=jsonl_path,
+                model_type=target_llm,
+                url=openai_url,
+                max_tokens=chat_max_tokens,
+            )
+            batch_submit_info, batch_result_info = submit_batch_request_openai(
+                client=client,
+                input_file_path=jsonl_path,
+                url=openai_url,
+                description=f"benchmark {config_dict['task']} for {target_llm}",
+            )
+            logger.info("Batch submitted, waiting for completion...")
+            wait_for_batch_completion(client, batch_submit_info.id)
+            batch_result_info = client.batches.retrieve(batch_submit_info.id)
+            file_response = client.files.content(batch_result_info.output_file_id)
+            raw_message_list = []
+            for i in file_response.iter_lines():
+                info = json.loads(i)
+                raw_message_list.append(info)
+                code = extract_code(info["response"]["body"]["choices"][0]["message"]["content"])
+                custom_id = info["custom_id"]
+                item_id = int(custom_id.split("_")[1])
+                code_message_list.append({
+                    "item_id": item_id,
+                    "code": code
+                })
+            result = {
+                "raw_message_list": raw_message_list,
+                "code_message_list": code_message_list,
+                "batch_submit_info": batch_submit_info,
+                "batch_result_info": batch_result_info,
+                "prompt_message_list": prompt_message_list,
+            }
+        else:
+            raw_message_list = []
+            for idx, messages in enumerate(
+                tqdm(message_list, desc="Evaluating (chat completions)")
+            ):
+                response = client.chat.completions.create(
+                    model=target_llm,
+                    messages=messages,
+                    max_tokens=chat_max_tokens,
+                )
+                content = response.choices[0].message.content or ""
+                info = {
+                    "custom_id": request_id_list[idx],
+                    "response": {
+                        "body": {
+                            "choices": [
+                                {"message": {"content": content}}
+                            ]
+                        }
+                    },
+                }
+                raw_message_list.append(info)
+                code = extract_code(content)
+                code_message_list.append({
+                    "item_id": idx,
+                    "code": code
+                })
+            result = {
+                "raw_message_list": raw_message_list,
+                "code_message_list": code_message_list,
+                "batch_submit_info": None,
+                "batch_result_info": None,
+                "prompt_message_list": prompt_message_list,
+            }
     elif "gemini" in target_llm:
         # Google API
         google_api_key = config_dict["env"]["google_api_key"]
@@ -190,7 +330,9 @@ def main(
     
     logger.info(f"Evaluating {len(code_message_list)} test cases...")
     # Temporarily save the result
-    with open(os.path.join(result_dir, f"llm_evaluation_{target_llm}.pkl"), "wb") as file:
+    pkl_path = os.path.join(result_dir, f"llm_evaluation_{artifact_tag}.pkl")
+    _ensure_parent_dir(pkl_path)
+    with open(pkl_path, "wb") as file:
         pickle.dump(result, file)
     for item in code_message_list:
         eval_item = {"result": None, "error": None}
@@ -210,8 +352,8 @@ def main(
             eval_item["error"] = error_info
         result["eval_result"].append(eval_item)
     
-    logger.info(f"Saving results to {os.path.join(result_dir, f'llm_evaluation_{target_llm}.pkl')}")
-    with open(os.path.join(result_dir, f"llm_evaluation_{target_llm}.pkl"), "wb") as file:
+    logger.info(f"Saving results to {pkl_path}")
+    with open(pkl_path, "wb") as file:
         pickle.dump(result, file)
         
         
