@@ -1272,6 +1272,20 @@ def generate_and_collect_test_case(
 
 LLM_EVAL_PROMPT = '''You are provided with API documentation and task-specific instructions. Based on this information, generate the corresponding code to fulfill the task requirements.'''
 
+
+def _assemble_llm_eval_prompt(doc: str, instruction_inner: str, task_specific_prompt: str) -> str:
+    """Same full prompt shape as `StateEval` builds from agent_data (used by StateEvalHF rows with agent_data)."""
+    return (
+        LLM_EVAL_PROMPT
+        + "\n\n===The documentation===:\n"
+        + doc
+        + "\n\n===The instructions===:\n"
+        + instruction_inner
+        + "\n\n"
+        + task_specific_prompt
+    )
+
+
 class StateEval():
     """
     Utility class for loading generated test cases and evaluating LLM-generated code against them.
@@ -1316,27 +1330,53 @@ class StateEval():
         
         with open(self.agent_path, "r") as f:
             agent_data = json.load(f)
-            for info_idx in (agent_data):
+            for info_idx in agent_data:
                 info = agent_data[info_idx]
                 prompt = self.get_prompt(info)
                 if prompt is None:
                     logger.warning(f"Generation for idx: {info_idx} failed")
                 else:
-                    self.prompt_book[info_idx] = LLM_EVAL_PROMPT + "\n\n===The documentation===:\n" f"{self.doc}" + \
-                        "\n\n===The instructions===:\n" + prompt + "\n\n" + task_specific_prompt
-                
-        #self.evaluator_book = list(self.evaluator_book.values())
-        #self.prompt_book = list(self.prompt_book.values())
-        self.index_list = list(self.evaluator_book.keys())
+                    # JSON keys may be str; evaluator_book uses int — always str() for lookups.
+                    self.prompt_book[str(info_idx)] = _assemble_llm_eval_prompt(self.doc, prompt, task_specific_prompt)
+
+        missing_prompts = [idx for idx in self.evaluator_book.keys() if str(idx) not in self.prompt_book]
+        if missing_prompts:
+            logger.warning(
+                f"Missing prompts for evaluator indices {sorted(missing_prompts)}; they will be skipped. "
+                f"Typical cause: agent translation did not end with evaluator OK for those traces, or "
+                f"agent_data.json path is out of sync with evaluator_*.json under {self.parent_path}."
+            )
+        # Only indices that have both a loaded evaluator and a successful prompt (same idea as StateEvalHF).
+        self.index_list = [idx for idx in sorted(self.evaluator_book.keys()) if str(idx) in self.prompt_book]
 
     
     @staticmethod
     def get_prompt(agent_conv: dict):
-        if "OK" in agent_conv['evaluator_messages'][-1]['content']:
-            prompt = agent_conv['generator_messages'][-1]['content']
-            return prompt
-        else:
+        if not agent_conv.get("evaluator_messages"):
             return None
+        if not agent_conv.get("generator_messages"):
+            return None
+        if not StateEval._evaluator_accepted(agent_conv):
+            return None
+        return agent_conv["generator_messages"][-1]["content"]
+
+    @staticmethod
+    def _evaluator_accepted(agent_conv: dict) -> bool:
+        """True if the last translation round was accepted (legacy 'OK' text or JSON verdict ok)."""
+        structured = agent_conv.get("last_evaluator_structured")
+        if isinstance(structured, dict) and structured.get("verdict") == "ok":
+            return True
+        last = agent_conv["evaluator_messages"][-1]
+        content = (last.get("content") or "").strip()
+        if "OK" in content:
+            return True
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and parsed.get("verdict") == "ok":
+                return True
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return False
     
     def __getitem__(self, idx: int):
         real_idx = self.index_list[idx]
@@ -1430,7 +1470,13 @@ class StateEvalHF():
         return rows
 
     def _build_from_rows(self, rows: List[dict], evaluation_config: Dict[str, Any], task_specific_prompt: str):
-        """Build evaluator/prompt books from HF dataset rows."""
+        """Build evaluator/prompt books from HF dataset rows.
+
+        Prompt source per row (first match wins):
+        - ``agent_data_json`` / ``agent_data``: serialized agent conversation; use
+          :meth:`StateEval.get_prompt` (same rules as local ``agent_data.json``, including JSON ``verdict: ok``).
+        - ``prompt``: pre-built string (existing HF pack format from ``hf_dataset.pack``).
+        """
         if not rows:
             return
         # Metadata is duplicated per row; take the first.
@@ -1450,11 +1496,28 @@ class StateEvalHF():
             else:
                 evaluator_payload = evaluator_payload_raw
             self.evaluator_book[idx] = self.evaluator_class.load(evaluator_payload, evaluation_config)
-            prompt = row.get("prompt")
+            doc = getattr(self, "doc", "") or ""
+            prompt = None
+            agent_raw = row.get("agent_data_json") or row.get("agent_data")
+            if agent_raw is not None:
+                if isinstance(agent_raw, str):
+                    try:
+                        agent_conv = json.loads(agent_raw)
+                    except json.JSONDecodeError:
+                        agent_conv = None
+                else:
+                    agent_conv = agent_raw
+                if isinstance(agent_conv, dict):
+                    inner = StateEval.get_prompt(agent_conv)
+                    if inner is not None:
+                        prompt = _assemble_llm_eval_prompt(doc, inner, task_specific_prompt)
+            if not prompt:
+                plain = row.get("prompt")
+                if plain:
+                    prompt = plain
             if prompt:
                 self.prompt_book[str(idx)] = prompt
-    
-    
+
     def __getitem__(self, idx: int):
         real_idx = self.index_list[idx]
         return self.prompt_book[str(real_idx)]

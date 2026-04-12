@@ -402,16 +402,17 @@ def _apply_batch_line_to_agents(agent_book: dict, item: dict) -> None:
     custom_id = item["custom_id"]
     body = item["response"]["body"]["choices"][0]["message"]
     _record_assistant_reply(agent_book, custom_id, body["content"], body["role"])
-GENERATOR_PROMPT = '''You are given a block of sequential API calls produced by a fuzzing engine, along with an optional initialization block. Your task is to translate these API calls into precise natural language descriptions that could be used as programming instructions for a developer.
+GENERATOR_PROMPT = '''You are a Senior Software Engineer translating a block of sequential API calls into a precise, natural language feature request or task description.
 
 Requirements:
-	1.	The description must be unambiguous and accurately capture the semantics of the program.
-	2.	The output should closely resemble how a programmer would describe a task in a typical software development scenario (e.g., feature request, ticket description, or implementation notes).
-	3.	Instead of word-by-word translation, write the description in a humanlike and scenario-driven style, as if you are specifying a real-world feature or task.
-	4.	The initialization block gives contextual information. While the values might differ, the variable's names should be fixed. You should provide variable names and explain them in the task descriptions. They are the parameters to the program. 
-	5.	When describing the task requirements, include as few constants as possible. 
-	6.	Do not include code in the output — only natural language.
-    7.  Since an API documentation will be provided later along with the natural language descriptions, it is OK to omit some details regarding API formal specifications -- only natural language descriptions.
+    1.  UNAMBIGUITY IS THE FIRST PRIORITY. The description must be unambiguously accurate regarding the program's final goal and side effects, but it should not be a line-by-line translation. 
+    2.  If detailing the step-by-step logic, intermediate states, or using a pseudo-code-like structure is necessary to ensure the task is solvable and unambiguous, you are encouraged to do so.
+    3.  When 1, can be met, write in a scenario-driven style (e.g., a Jira ticket or implementation spec) focusing on the "What" and the "Why", rather than micromanaging the "How".
+    3.  Level of Abstraction: Do not spoon-feed the target developer. Omit trivial intermediate variables, boilerplate data transformations, or obvious implicit state transitions. Allow the target developer to infer these hidden states based on standard software engineering practices.
+    4.  The initialization block gives contextual information. While the values might differ, the variables' names should be fixed. Define user variables/constants from the init block in the task description with their types/structures (e.g., dict with specific keys), but DO NOT show their exact values. ONLY refer to their names.
+    5.  Include as few literal constants as possible in the task requirements.
+    6.  Do not include raw code or API names in the output — use natural language exclusively. (Since API documentation will be provided to the developer later, omit formal API specifications).
+    7.  If there is a RESULT variable, specify what the final output should represent, as its value will be tested.
 
 {application_description}
 
@@ -426,17 +427,23 @@ Program:
 {program}
 ```
 
-In your description, first define user variable/constant name (such as user_variable_0) in the init block with necessary descriptions of their types and structures (e.g., dict with what key), 
-but do not directly show their values since they may change with respect to different test cases. The user-defined contents will be automatically loaded upon evaluation.
-Provide necessary instructions when these variable/constant names are referred to. ONLY refer to names, not values. 
-All user-provided content should be used (e.g., when the variable value matches user_constant_0) if they are referred in the program.
-If there is RESULT variable, specify it as its vaule will be checked using test cases.
+Instructions for Output:
+First, define the user variables/constants. Then, write the task instructions. 
+Remember: The generated description evaluates an LLM's ability to reason through software design. If your description reads like a literal translation of the fuzzed code, it is too naive. Abstract the logic so the LLM must deduce the correct sequence of states to achieve the described goal.
 
-Note: The generated description will be used to evaluate LLMs' ability to understand natural language and produce correct stateful code.
-Aim to make the description as unambiguous as possible. When appropriate, allow the LLM to infer implicit states instead of explicitly specifying every detail.
+Encode your answer as a single JSON object (see Output Format section appended to this prompt). Use fields `user_variable_definitions` and `task_instructions` for the prose. Do not emit XML-like tags in the JSON string values unless they are natural-language content.
 
-Encode your answer as a single JSON object (see Output Format section appended to this prompt). Use fields ``user_variable_definitions`` and ``task_instructions`` for the prose that would previously have appeared under <User Variable Definition> and <Task Instructions> respectively. Do not emit those XML-like tags in the JSON string values unless they are natural-language content.
 '''
+#In your description, first define user variable/constant name (such as user_variable_0) in the init block with necessary descriptions of their types and structures (e.g., dict with what key), 
+#but do not directly show their values since they may change with respect to different test cases. The user-defined contents will be automatically loaded upon evaluation.
+#Provide necessary instructions when these variable/constant names are referred to. ONLY refer to names, not values. 
+#All user-provided content should be used (e.g., when the variable value matches user_constant_0) if they are referred in the program.
+#If there is RESULT variable, specify it as its vaule will be checked using test cases.
+
+#Note: The generated description will be used to evaluate LLMs' ability to understand natural language and produce correct stateful code.
+#Aim to make the description as unambiguous as possible. When appropriate, allow the LLM to infer implicit states instead of explicitly specifying every detail.
+
+#Encode your answer as a single JSON object (see Output Format section appended to this prompt). Use fields ``user_variable_definitions`` and ``task_instructions`` for the prose that would previously have appeared under <User Variable Definition> and <Task Instructions> respectively. Do not emit those XML-like tags in the JSON string values unless they are natural-language content.
 
 
 def _format_program_intent_context_for_generator(program_intent_summary: str) -> str:
@@ -458,20 +465,22 @@ GENERATOR_IMPROVE_PROMPT = ''' An evaluator agent has checked the descriptions a
 '''
 
 EVALUATOR_PROMPT = '''
-You are a checker agent tasked with evaluating the quality of a natural language description that was generated from a sequence of API calls. Your job is to determine whether the description meets two key criteria:
+You are a Senior Technical Lead evaluating the quality of a natural language task description generated from a sequence of API calls. Your job is to ensure the description is highly accurate but written at an appropriate level of abstraction for a competent developer.
 
-1.  Fidelity to the Program Logic
-	a. Does the natural language description accurately reflect all steps of the given API call sequence?
-	b. Would a developer be able to reconstruct the original program logic (or a functionally equivalent one) based solely on the description?
-	c. Are any steps missing, incorrectly described, or added?
-	d. Is there any ambiguity? For example, sometimes "update" can refer to either "local update" or "remote update through APIs." 
-2.  Human-likeness and Fluency
-	a. Does the description sound natural and fluent, as if it were written by a human programmer?
-    b. Does the description present the task in a plausible use-case or user scenario?
-	c. Is the tone and phrasing consistent with how developers describe implementation tasks?
-3.  Redundancy
-	a. Is the description redundant? For example, if the description is too verbose or if it contains unnecessary details that could be inferred from other parts of the description.
-
+1.  Fidelity and Unambiguity (CRITICAL)
+    a. Does the description accurately and exhaustively capture the required logic, state transitions, and final goals of the API sequence?
+    b. Would a developer be able to reconstruct the exact functional logic based solely on the description without making guesses?
+    c. Are any steps missing, incorrectly described, or is there any ambiguity?
+2.  Abstraction & Inference (Avoiding Naivety)
+    a. Is the description too naive? (e.g., reading like literal pseudo-code or a mechanical, line-by-line translation). However, when these descriptions are needed to ensure the task is solvable and unambiguous, it is OK to do so.
+    b. Does it successfully omit trivial intermediate steps, obvious state-keeping, or boilerplate logic, leaving room for the target programmer to infer them?
+    c. If the description spoon-feeds the developer the exact sequence of logic step-by-step, it FAILS this criterion.
+3.  Human-likeness and Fluency
+    a. Does the description sound natural, as if written by a product manager or senior engineer creating a Jira ticket?
+    b. Is it grounded in a plausible user scenario rather than isolated logic?
+4.  Redundancy
+    a. Is the description overly verbose or repetitive?
+    
 Respond with a single JSON object (see Output Format section appended to this prompt). Use verdict ``ok`` if all criteria are met, ``needs_revision`` if issues are found (fill diagnosis and suggestions), or ``impossible`` if no satisfactory description exists.
 Below is the program:
 ```
