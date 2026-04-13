@@ -83,6 +83,18 @@ def main(
         use_api_structured_output = bool(
             agent_config.get("use_api_structured_output", True)
         )
+    frb_env = os.environ.get("TRANSLATION_FINAL_ROUND_BINARY_VERDICT")
+    if frb_env is not None and str(frb_env).strip():
+        final_round_binary_verdict = str(frb_env).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    else:
+        final_round_binary_verdict = bool(
+            agent_config.get("final_round_binary_verdict", True)
+        )
     if not api_key:
         raise ValueError(
             "Missing API key. Set API_KEY/OPENAI_API_KEY in environment or openai_api_key in config."
@@ -137,7 +149,8 @@ def main(
         f"Translation LLM: model={translation_model}, evaluator model={evaluator_model}, "
         f"base_url={base_url or '[default]'}, "
         f"batch_mode={translation_batch_mode}, temperature={temperature}, "
-        f"use_api_structured_output={use_api_structured_output}"
+        f"use_api_structured_output={use_api_structured_output}, "
+        f"final_round_binary_verdict={final_round_binary_verdict}"
     )
     agent_manager = MultiAgentTrans(
         program_info=program_info,
@@ -151,6 +164,7 @@ def main(
         batch_mode=translation_batch_mode,
         temperature=temperature,
         use_api_structured_output=use_api_structured_output,
+        final_round_binary_verdict=final_round_binary_verdict,
     )
     
     agent_manager.interact_loop(program_info, agent_save_path)

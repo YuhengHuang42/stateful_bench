@@ -176,7 +176,7 @@ STRUCTURED_API_GENERATOR_PROMPT_TAIL = (
 )
 STRUCTURED_API_EVALUATOR_PROMPT_TAIL = (
     "\n\nThe API enforces the response shape: a JSON object with string field "
-    "``verdict`` (one of: ok, needs_revision, impossible) and optional string "
+    "``verdict`` (one of: ok, needs_revision, impossible, rejection) and optional string "
     "fields ``diagnosis`` and ``suggestions``.\n"
 )
 
@@ -201,10 +201,10 @@ class TranslationGeneratorResponse(BaseModel):
 class TranslationEvaluatorResponse(BaseModel):
     """Structured evaluator output."""
 
-    verdict: Literal["ok", "needs_revision", "impossible"] = Field(
+    verdict: Literal["ok", "needs_revision", "impossible", "rejection"] = Field(
         description=(
             "ok = description meets all criteria; needs_revision = issues found; "
-            "impossible = cannot satisfy criteria."
+            "impossible = cannot satisfy criteria; rejection = final-round not accepted."
         )
     )
     diagnosis: str = Field(
@@ -246,6 +246,25 @@ def _parse_evaluator_response_text(
     return TranslationEvaluatorResponse.model_validate(
         _extract_json_from_response(text, EVALUATOR_RESPONSE_JSON_KEYS)
     )
+
+
+def _normalize_evaluator_verdict(
+    parsed: TranslationEvaluatorResponse,
+    *,
+    final_round_binary_verdict: bool = False,
+) -> TranslationEvaluatorResponse:
+    """In the last evaluator round, collapse non-ok outcomes to rejection."""
+    if not final_round_binary_verdict:
+        return parsed
+    if parsed.verdict == "ok":
+        return parsed
+    if parsed.verdict in {"needs_revision", "impossible"}:
+        return TranslationEvaluatorResponse(
+            verdict="rejection",
+            diagnosis=(parsed.diagnosis or "").strip(),
+            suggestions=(parsed.suggestions or "").strip(),
+        )
+    return parsed
 
 
 def _format_generator_for_evaluator(
@@ -614,11 +633,13 @@ class Evaluator():
                  max_iterations, 
                  evaluator_prompt=EVALUATOR_PROMPT, 
                  further_prompt=EVALUATOR_FURTHER_PROMPT,
-                 use_api_structured_output: bool = False):
+                 use_api_structured_output: bool = False,
+                 final_round_binary_verdict: bool = True):
         self.application_description = application_description
         self.evaluator_prompt = evaluator_prompt
         self.further_prompt = further_prompt
         self.use_api_structured_output = use_api_structured_output
+        self.final_round_binary_verdict = final_round_binary_verdict
         self.status = AgentStatus.BEGIN
         self.request_counter = 0
         self.max_iterations = max_iterations
@@ -628,30 +649,46 @@ class Evaluator():
             "content": None,
         }]
         
-    def get_evaluate_prompt(self, init_block, program, description):
+    def get_evaluate_prompt(self, init_block, program, description, final_round: bool = False):
         body = self.evaluator_prompt.format(
             init_block=init_block,
             program=program,
             description=description,
         )
+        if final_round and self.final_round_binary_verdict:
+            body += (
+                "\n\nThis is the LAST evaluation round. "
+                "Use verdict `ok` if acceptable; otherwise use verdict `rejection`. "
+                "Do not use `needs_revision` in this final round."
+            )
         if self.use_api_structured_output:
             return body + STRUCTURED_API_EVALUATOR_PROMPT_TAIL
         schema_json = _compact_schema(TranslationEvaluatorResponse.model_json_schema())
         return body + _JSON_OUTPUT_INSTRUCTION + schema_json
 
-    def get_further_prompt(self, description):
+    def get_further_prompt(self, description, final_round: bool = False):
         body = self.further_prompt.format(description=description)
+        if final_round and self.final_round_binary_verdict:
+            body += (
+                "\n\nThis is the LAST evaluation round. "
+                "Use verdict `ok` if acceptable; otherwise use verdict `rejection`. "
+                "Do not use `needs_revision` in this final round."
+            )
         if self.use_api_structured_output:
             return body + STRUCTURED_API_EVALUATOR_PROMPT_TAIL
         schema_json = _compact_schema(TranslationEvaluatorResponse.model_json_schema())
         return body + _JSON_OUTPUT_INSTRUCTION + schema_json
 
-    def whether_continue(self, return_string):
+    def whether_continue(self, return_string, final_round: bool = False):
         parsed = _parse_evaluator_content(
             return_string,
             use_api_structured_output=self.use_api_structured_output,
         )
         if parsed is not None:
+            parsed = _normalize_evaluator_verdict(
+                parsed,
+                final_round_binary_verdict=(final_round and self.final_round_binary_verdict),
+            )
             return parsed.verdict == "needs_revision"
         if "<OK>" in return_string or "<IMPOSSIBLE>" in return_string:
             return False
@@ -663,12 +700,21 @@ class Evaluator():
             assert "program" in info_dict
             assert "description" in info_dict
             self.status = AgentStatus.CONTINUE
-            self.message[0]["content"] = self.get_evaluate_prompt(info_dict["init_block"], info_dict["program"], info_dict["description"])
+            final_round = (self.request_counter + 1) >= self.max_iterations
+            self.message[0]["content"] = self.get_evaluate_prompt(
+                info_dict["init_block"],
+                info_dict["program"],
+                info_dict["description"],
+                final_round=final_round,
+            )
             self.request_counter += 1
             return True, self.message
         elif self.status == AgentStatus.CONTINUE:
             assert "description" in info_dict
-            user_prompt = self.get_further_prompt(info_dict["description"])
+            final_round = (self.request_counter + 1) >= self.max_iterations
+            user_prompt = self.get_further_prompt(
+                info_dict["description"], final_round=final_round
+            )
             self.message.append({
                 "role": "user",
                 "content": user_prompt
@@ -680,7 +726,8 @@ class Evaluator():
     
     def record_response(self, message):
         self.message.append(message)
-        flag = self.whether_continue(message["content"])
+        final_round = self.request_counter >= self.max_iterations
+        flag = self.whether_continue(message["content"], final_round=final_round)
         if flag:
             self.status = AgentStatus.CONTINUE
         else:
@@ -716,7 +763,8 @@ class MultiAgentTrans():
                  evaluator_agent_params=None,
                  batch_mode: bool = False,
                  temperature: float = 1.0,
-                 use_api_structured_output: bool = True):
+                 use_api_structured_output: bool = True,
+                 final_round_binary_verdict: bool = True):
         '''
         Args:
             program_info: list of program info
@@ -736,6 +784,7 @@ class MultiAgentTrans():
                 prompt-only JSON plus heuristic extraction.
         '''
         self.use_api_structured_output = use_api_structured_output
+        self.final_round_binary_verdict = final_round_binary_verdict
         self.agent_book = self.prepare_agent(
             program_info,
             max_iterations,
@@ -743,6 +792,7 @@ class MultiAgentTrans():
             generator_prompt,
             evaluator_prompt,
             use_api_structured_output=use_api_structured_output,
+            final_round_binary_verdict=final_round_binary_verdict,
         )
         self.max_iterations = max_iterations
         self.message_recorder = dict()
@@ -778,6 +828,7 @@ class MultiAgentTrans():
         evaluator_prompt=EVALUATOR_PROMPT,
         *,
         use_api_structured_output: bool = False,
+        final_round_binary_verdict: bool = True,
     ):
         agent_book = dict()
         for idx, item in enumerate(program_info):
@@ -793,6 +844,7 @@ class MultiAgentTrans():
                     max_iterations,
                     evaluator_prompt,
                     use_api_structured_output=use_api_structured_output,
+                    final_round_binary_verdict=final_round_binary_verdict,
                 ),
             }
         return agent_book
@@ -1094,10 +1146,18 @@ class MultiAgentTrans():
                     break
             if last_evaluator_output:
                 try:
-                    last_evaluator_structured = _parse_evaluator_response_text(
+                    parsed_eval = _parse_evaluator_response_text(
                         last_evaluator_output,
                         use_api_structured_output=self.use_api_structured_output,
-                    ).model_dump()
+                    )
+                    is_final_round = evaluator.request_counter >= evaluator.max_iterations
+                    parsed_eval = _normalize_evaluator_verdict(
+                        parsed_eval,
+                        final_round_binary_verdict=(
+                            self.final_round_binary_verdict and is_final_round
+                        ),
+                    )
+                    last_evaluator_structured = parsed_eval.model_dump()
                 except Exception as e:
                     logger.warning(
                         "Could not parse last evaluator reply as "

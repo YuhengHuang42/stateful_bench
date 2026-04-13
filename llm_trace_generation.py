@@ -310,7 +310,7 @@ STRUCTURED_API_ROUND2_PROMPT_TAIL = (
 def _parse_round1_response_text(
     text: str,
     *,
-    use_api_structured_output: bool = False,
+    use_api_structured_output: bool = True,
 ) -> Round1Response:
     if use_api_structured_output:
         try:
@@ -325,7 +325,7 @@ def _parse_round1_response_text(
 def _parse_round2_response_text(
     text: str,
     *,
-    use_api_structured_output: bool = False,
+    use_api_structured_output: bool = True,
 ) -> Round2Response:
     if use_api_structured_output:
         try:
@@ -509,6 +509,18 @@ _JSON_OUTPUT_INSTRUCTION = (
 )
 
 
+def _should_retry_llm_with_max_completion_tokens(error_text: str) -> bool:
+    """Detect 'use max_completion_tokens instead of max_tokens' (OpenAI + compatible gateways)."""
+    if not error_text:
+        return False
+    t = error_text.lower()
+    return (
+        "max_completion_tokens" in error_text
+        and "max_tokens" in error_text
+        and ("unsupported" in t or "invalid_request" in t or "not supported" in t)
+    )
+
+
 def _compact_schema(schema: dict) -> str:
     """Produce a minimal JSON schema string, stripping verbose Pydantic metadata."""
     def _strip(obj):
@@ -560,7 +572,21 @@ def _call_llm(
     }
     if response_format is not None:
         kwargs["response_format"] = response_format
-    response = client.chat.completions.create(**kwargs)
+    token_limit_param = "max_tokens"
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        if _should_retry_llm_with_max_completion_tokens(str(e)):
+            kwargs.pop("max_tokens", None)
+            kwargs["max_completion_tokens"] = max_tokens
+            token_limit_param = "max_completion_tokens"
+            logger.debug(
+                "Retrying chat.completions with max_completion_tokens=… "
+                "(API rejected max_tokens for this model)."
+            )
+            response = client.chat.completions.create(**kwargs)
+        else:
+            raise
     elapsed = time.time() - t0
     choice = response.choices[0]
     text = choice.message.content or ""
@@ -576,7 +602,7 @@ def _call_llm(
         raise ValueError(
             f"LLM response truncated (finish_reason='length', "
             f"completion_tokens={usage['completion_tokens']}, "
-            f"max_tokens={max_tokens}). Increase max_tokens."
+            f"{token_limit_param}={max_tokens}). Increase the token limit in config."
         )
     return text, usage
 
@@ -702,7 +728,7 @@ def _build_round1_user_content(
     transition_chains: List[List[str]],
     api_documentation: str,
     *,
-    use_api_structured_output: bool = False,
+    use_api_structured_output: bool = True,
 ) -> str:
     """Assemble the user message for Round 1."""
     example_input = _format_program_info_as_example_input(program_info)
@@ -738,7 +764,7 @@ def _build_round2_followup(
     max_api_modifications: int,
     pair_transition_str: str,
     *,
-    use_api_structured_output: bool = False,
+    use_api_structured_output: bool = True,
 ) -> str:
     """Build the Round 2 follow-up user message.
 
@@ -2069,6 +2095,8 @@ def main(
     llm_config["fix_llm_model"] = os.environ.get("FIX_LLM_MODEL", "")
     llm_config["fix_llm_api_key"] = os.environ.get("FIX_LLM_API_KEY", api_key)
     llm_modify_fn = llm_modify_program if use_llm else llm_modify_program_mock
+    use_api_structured_output = generation_config.get("use_api_structured_output", True)
+    llm_config["use_api_structured_output"] = use_api_structured_output
     if use_llm:
         logger.info(
             f"Using real LLM: model={llm_config['model']}, "
