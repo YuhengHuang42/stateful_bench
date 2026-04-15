@@ -1991,10 +1991,62 @@ def _ensure_parent_dir(path_like: Any) -> None:
         os.makedirs(parent_dir, exist_ok=True)
 
 
+def _discover_existing_evaluator_indices(trace_save_path: Path) -> List[int]:
+    """Return sorted evaluator indices already present under *trace_save_path*."""
+    evaluator_indices: List[int] = []
+    try:
+        file_names = os.listdir(str(trace_save_path))
+    except FileNotFoundError:
+        return evaluator_indices
+    for name in file_names:
+        match = re.fullmatch(r"evaluator_(\d+)\.json", name)
+        if match:
+            evaluator_indices.append(int(match.group(1)))
+    evaluator_indices.sort()
+    return evaluator_indices
+
+
+def _load_metadata_if_exists(run_dir: Path) -> Dict[str, Any]:
+    """Load ``metadata.pkl`` from *run_dir* when present; otherwise return {}."""
+    metadata_path = run_dir / "metadata.pkl"
+    if not metadata_path.exists():
+        return {}
+    try:
+        with open(metadata_path, "rb") as f:
+            payload = pickle.load(f)
+        if isinstance(payload, dict):
+            return payload
+    except Exception as e:
+        logger.warning(f"Failed to load resume metadata from {metadata_path}: {e}")
+    return {}
+
+
+def _normalize_int_key_dict(raw: Any) -> Dict[int, Any]:
+    """Convert a mapping with string/int keys into an int-keyed dict."""
+    normalized: Dict[int, Any] = {}
+    if not isinstance(raw, dict):
+        return normalized
+    for key, value in raw.items():
+        try:
+            normalized[int(key)] = value
+        except Exception:
+            continue
+    return normalized
+
+
 @app.command()
 def main(
     config_file: Annotated[Path, typer.Option()],
     trace_save_path: Annotated[Path, typer.Option()] = None,
+    resume_from_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=(
+                "Existing run folder to resume from. Loads "
+                "occurence_book.json and metadata.pkl from this folder."
+            ),
+        ),
+    ] = None,
     occurence_book_path: Annotated[
         Path,
         typer.Option(help="Path to persistent OccurenceBook JSON."),
@@ -2028,8 +2080,34 @@ def main(
     num_of_tests = generation_config["num_of_tests"]
 
     if trace_save_path is None:
-        trace_save_path = config_dict["env"]["trace_save_path"]
+        trace_save_path = Path(config_dict["env"]["trace_save_path"])
+    else:
+        trace_save_path = Path(trace_save_path)
     os.makedirs(str(trace_save_path), exist_ok=True)
+
+    save_occurence_book_path = (
+        Path(occurence_book_path)
+        if occurence_book_path is not None
+        else trace_save_path / "occurence_book.json"
+    )
+
+    resume_metadata: Dict[str, Any] = {}
+    load_occurence_book_path = save_occurence_book_path
+    if resume_from_path is not None:
+        resume_from_path = Path(resume_from_path)
+        default_resume_book = resume_from_path / "occurence_book.json"
+        if default_resume_book.exists():
+            load_occurence_book_path = default_resume_book
+        logger.info(
+            f"Resuming generation from {resume_from_path} (loaded book: {load_occurence_book_path}) and writing new outputs to {trace_save_path}",
+       
+        )
+        resume_metadata = _load_metadata_if_exists(resume_from_path)
+    else:
+        logger.info(
+            f"Loading occurrence book from {load_occurence_book_path} and writing outputs to {trace_save_path}",
+       
+        )
 
     log_file_path = (
         generation_config.get("log_file_path")
@@ -2039,12 +2117,7 @@ def main(
     if log_file_path:
         _ensure_parent_dir(log_file_path)
 
-    if occurence_book_path is None:
-        occurence_book_path = os.path.join(
-            str(trace_save_path), "occurence_book.json"
-        )
-
-    occurence_book = OccurenceBook.load(str(occurence_book_path))
+    occurence_book = OccurenceBook.load(str(load_occurence_book_path))
 
     if occurence_book.has_pending_discards():
         logger.info(
@@ -2056,6 +2129,8 @@ def main(
 
     # -- Load API documentation if provided --
     api_documentation = None
+    if simplify_doc is None:
+        raise NotImplementedError("Without simplify_doc, api_doc_file mode is not implemented")
     if api_doc_file is None:
         doc_key = "api_doc_file_simplified" if simplify_doc else "api_doc_file"
         if doc_key in config_dict["generation_config"]:
@@ -2175,8 +2250,27 @@ def main(
         raise ValueError(f"Task {config_dict['task']} is not supported.")
 
     evaluator_book: Dict[int, Any] = {}
-    occ_book_diff_recorder: Dict[int, Any] = {}
+    occ_book_diff_recorder: Dict[int, Any] = _normalize_int_key_dict(
+        resume_metadata.get("occ_book_diff_recorder")
+    )
     llm_results_recorder: Dict[int, LLMModificationResult] = {}
+    existing_evaluator_indices = _discover_existing_evaluator_indices(trace_save_path)
+    resume_history_indices = sorted(occ_book_diff_recorder.keys())
+    if not resume_history_indices:
+        resume_history_indices = sorted(
+            _normalize_int_key_dict(resume_metadata.get("llm_results")).keys()
+        )
+    all_existing_indices = sorted(set(existing_evaluator_indices + resume_history_indices))
+    next_evaluator_idx = (
+        all_existing_indices[-1] + 1 if all_existing_indices else 0
+    )
+    if all_existing_indices:
+        logger.info(
+            "Found existing run history (max index=%d); newly "
+            "generated traces continue from evaluator_%d.json.",
+            all_existing_indices[-1],
+            next_evaluator_idx,
+        )
 
     enable_coverage = generation_config.get("enable_coverage", True)
     if not enable_coverage:
@@ -2207,9 +2301,10 @@ def main(
         )
         if is_success:
             occurence_book = new_book
-            occ_book_diff_recorder[idx] = occ_diff
-            evaluator_book[idx] = evaluator
-            llm_results_recorder[idx] = llm_result
+            occ_book_diff_recorder[next_evaluator_idx] = occ_diff
+            evaluator_book[next_evaluator_idx] = evaluator
+            llm_results_recorder[next_evaluator_idx] = llm_result
+            next_evaluator_idx += 1
             idx += 1
             consecutive_failures = 0
             pbar.update(1)
@@ -2237,8 +2332,8 @@ def main(
         )
         evaluator_book[eidx].store(evaluator_save_path)
 
-    occurence_book.save(str(occurence_book_path))
-    logger.info(f"OccurenceBook saved to {occurence_book_path}")
+    occurence_book.save(str(save_occurence_book_path))
+    logger.info(f"OccurenceBook saved to {save_occurence_book_path}")
 
     metadata_save_path = os.path.join(str(trace_save_path), "metadata.pkl")
     with open(metadata_save_path, "wb") as f:
