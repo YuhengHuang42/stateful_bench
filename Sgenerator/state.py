@@ -1273,14 +1273,140 @@ def generate_and_collect_test_case(
 LLM_EVAL_PROMPT = '''You are provided with API documentation and task-specific instructions. Based on this information, generate the corresponding code to fulfill the task requirements.'''
 
 
-def _assemble_llm_eval_prompt(doc: str, instruction_inner: str, task_specific_prompt: str) -> str:
+def _extract_preloaded_variable_names_from_program_info(program_info: dict) -> List[str]:
+    """Extract preloaded variable names from serialized evaluator program_info."""
+    names: List[str] = []
+    seen = set()
+
+    def _add(name: Any):
+        if not isinstance(name, str):
+            return
+        n = name.strip()
+        if not n or n in seen:
+            return
+        seen.add(n)
+        names.append(n)
+
+    if not isinstance(program_info, dict):
+        return names
+
+    # init_local_info shape is typically: [(name, value), ...]
+    for item in program_info.get("init_local_info") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            _add(item[0])
+
+    # init_load_info shape is typically: [(name, value), ...]
+    for item in program_info.get("init_load_info") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            _add(item[0])
+
+    return names
+
+
+def _extract_preloaded_variable_names_from_evaluator(evaluator: Any) -> List[str]:
+    """Extract representative preloaded variable names from the evaluator test cases."""
+    test_cases = getattr(evaluator, "test_cases", None)
+    if not isinstance(test_cases, list) or len(test_cases) == 0:
+        return []
+    first = test_cases[0]
+    if not isinstance(first, dict):
+        return []
+    program_info = first.get("program_info")
+    return _extract_preloaded_variable_names_from_program_info(program_info)
+
+
+def _format_preloaded_variable_names_block(variable_names: List[str]) -> str:
+    if len(variable_names) == 0:
+        return ""
+    items = "\n".join(f"- {name}" for name in variable_names)
+    return (
+        "\n\n===Preloaded variable names===:\n"
+        "The following variable names are preloaded at runtime and can be used directly:\n"
+        "Maintain variable name consistency. Use the provided names exactly; do not generate your own.\n"
+        f"{items}"
+    )
+
+
+def _normalize_instruction_text(instruction_inner: Any) -> str:
+    """Render instruction payload to evaluator-facing text.
+
+    If the payload is a JSON object (or a JSON-encoded string) containing
+    user-variable and task-instruction fields, render it as:
+    <User Variable Definition>
+    ...
+
+    <Task Instructions>
+    ...
+    """
+    def _as_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            return "\n".join(_as_text(v) for v in value if _as_text(v)).strip()
+        if isinstance(value, dict):
+            # Nested dict fallback keeps human-readable structure.
+            parts = []
+            for k, v in value.items():
+                t = _as_text(v)
+                if t:
+                    parts.append(f"{k}: {t}")
+            return "\n".join(parts).strip()
+        return str(value).strip()
+
+    payload: Any = instruction_inner
+    if isinstance(payload, str):
+        text = payload.strip()
+        if text and text[0] in "{[":
+            try:
+                payload = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                payload = instruction_inner
+
+    if isinstance(payload, dict):
+        user_defs_keys = ("user_variable_definitions", "user_variables", "variable_definitions")
+        task_keys = ("task_instructions", "instructions", "task")
+        user_defs = None
+        task_instr = None
+        for key in user_defs_keys:
+            if key in payload:
+                user_defs = payload.get(key)
+                break
+        for key in task_keys:
+            if key in payload:
+                task_instr = payload.get(key)
+                break
+        if user_defs is not None or task_instr is not None:
+            sections: List[str] = []
+            user_defs_text = _as_text(user_defs)
+            task_text = _as_text(task_instr)
+            if user_defs_text:
+                sections.append(f"<User Variable Definition>\n{user_defs_text}")
+            if task_text:
+                sections.append(f"<Task Instructions>\n{task_text}")
+            if sections:
+                return "\n\n".join(sections).strip()
+
+    return _as_text(instruction_inner)
+
+
+def _assemble_llm_eval_prompt(
+    doc: str,
+    instruction_inner: str,
+    task_specific_prompt: str,
+    preloaded_variable_names: Optional[List[str]] = None,
+) -> str:
     """Same full prompt shape as `StateEval` builds from agent_data (used by StateEvalHF rows with agent_data)."""
     return (
         LLM_EVAL_PROMPT
         + "\n\n===The documentation===:\n"
         + doc
         + "\n\n===The instructions===:\n"
-        + instruction_inner
+        + _normalize_instruction_text(instruction_inner)
+        + _format_preloaded_variable_names_block(preloaded_variable_names or [])
         + "\n\n"
         + task_specific_prompt
     )
@@ -1337,7 +1463,14 @@ class StateEval():
                     logger.warning(f"Generation for idx: {info_idx} failed")
                 else:
                     # JSON keys may be str; evaluator_book uses int — always str() for lookups.
-                    self.prompt_book[str(info_idx)] = _assemble_llm_eval_prompt(self.doc, prompt, task_specific_prompt)
+                    evaluator = self.evaluator_book.get(int(info_idx))
+                    variable_names = _extract_preloaded_variable_names_from_evaluator(evaluator)
+                    self.prompt_book[str(info_idx)] = _assemble_llm_eval_prompt(
+                        self.doc,
+                        prompt,
+                        task_specific_prompt,
+                        preloaded_variable_names=variable_names,
+                    )
 
         missing_prompts = [idx for idx in self.evaluator_book.keys() if str(idx) not in self.prompt_book]
         if missing_prompts:
@@ -1510,11 +1643,22 @@ class StateEvalHF():
                 if isinstance(agent_conv, dict):
                     inner = StateEval.get_prompt(agent_conv)
                     if inner is not None:
-                        prompt = _assemble_llm_eval_prompt(doc, inner, task_specific_prompt)
+                        variable_names = _extract_preloaded_variable_names_from_evaluator(
+                            self.evaluator_book.get(idx)
+                        )
+                        prompt = _assemble_llm_eval_prompt(
+                            doc,
+                            inner,
+                            task_specific_prompt,
+                            preloaded_variable_names=variable_names,
+                        )
             if not prompt:
                 plain = row.get("prompt")
                 if plain:
-                    prompt = plain
+                    variable_names = _extract_preloaded_variable_names_from_evaluator(
+                        self.evaluator_book.get(idx)
+                    )
+                    prompt = plain + _format_preloaded_variable_names_block(variable_names)
             if prompt:
                 self.prompt_book[str(idx)] = prompt
 

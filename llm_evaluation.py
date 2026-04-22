@@ -264,6 +264,25 @@ def main(
         Optional[int],
         typer.Option(help="Max completion tokens for chat (non-batch) OpenAI-compatible calls."),
     ] = 8192,
+    print_prompt_sample: Annotated[
+        bool,
+        typer.Option(
+            "--print-prompt-sample",
+            help="Print one assembled evaluation prompt and exit (no API calls).",
+        ),
+    ] = False,
+    prompt_index: Annotated[
+        int,
+        typer.Option(
+            help="Prompt index to print when --print-prompt-sample is used.",
+        ),
+    ] = 0,
+    prompt_max_chars: Annotated[
+        Optional[int],
+        typer.Option(
+            help="Optional max number of characters to print for the prompt sample.",
+        ),
+    ] = None,
 ):
     with open(config_file, 'r') as file:
         config_dict = yaml.safe_load(file)
@@ -282,6 +301,21 @@ def main(
     logger.info(f"StateEval loaded, {len(stateful_bench)} test cases in total.")
     if first_n > 0:
         logger.info(f"Evaluating the first {first_n} test cases.")
+    if print_prompt_sample:
+        available = len(stateful_bench) if first_n <= 0 else min(first_n, len(stateful_bench))
+        if available <= 0:
+            raise ValueError("No prompts available to print.")
+        if prompt_index < 0 or prompt_index >= available:
+            raise IndexError(
+                f"prompt_index={prompt_index} out of range for available prompts [0, {available - 1}]"
+            )
+        prompt_text = stateful_bench[prompt_index]
+        if prompt_max_chars is not None and prompt_max_chars > 0:
+            prompt_text = prompt_text[:prompt_max_chars]
+        typer.echo("=== Prompt Sample Begin ===")
+        typer.echo(prompt_text)
+        typer.echo("=== Prompt Sample End ===")
+        return
 
     open_source_model_list = ['llama-4-scout-17b-16e-instruct', "qwen3-32b-fp8", "deepseek-r1-0528", "qwen25-coder-32b-instruct"]
 
