@@ -1,7 +1,7 @@
 {
     "swagger": "2.0",
     "info": {
-      "description": "RESTful API to access cBioPortal/cbioportal sessions in MongoDB.",
+      "description": "cBioPortal session API (MongoDB). Call endpoints as {BASE_URL}/api/sessions/...; ignore swagger host. For /query, use field like data.<key> when matching nested session data.",
       "version": "1.0 (beta)",
       "title": "cBioPortal session-service API",
       "termsOfService": "www.cbioportal.org",

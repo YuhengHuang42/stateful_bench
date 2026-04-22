@@ -1,0 +1,11 @@
+// cBioPortal session-service API
+type SessionType = "main_session" | "virtual_study" | "group" | "comparison_session" | "settings" | "custom_data" | "genomic_chart" | "custom_gene_list";
+
+interface Session { id: string; source: string; type: SessionType; checksum: string; data: object; }
+
+// Endpoints
+GET    /api/sessions/{source}/{type} -> returns Iterable<Session>
+POST   /api/sessions/{source}/{type} (body: data as string) -> returns Session
+GET    /api/sessions/{source}/{type}/query?field={string}&value={string} -> returns Iterable<Session>
+PUT    /api/sessions/{source}/{type}/{id} (body: data as string) -> returns OK
+DELETE /api/sessions/{source}/{type}/{id} -> returns OK

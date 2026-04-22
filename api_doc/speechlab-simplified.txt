@@ -1,0 +1,18 @@
+# Types
+Speech = any # Represents the audio object payload
+
+# Tools
+def search_voice_library(search_name: str = None, search_category: str = None, search_gender: str = None) -> list[dict]:
+    """Returns: [{"voice_name": str, "category": str, "gender": str}, ...]"""
+
+def text_to_speech(text: str, voice_name: str = None, stability: float = None, similarity_boost: float = None, style: float = None) -> Speech:
+    """Note: float args range 0.0 to 1.0. Lower stability = more emotion; higher style = amplified speaker style."""
+
+def speech_to_speech(input_speech: Speech, voice_name: str) -> Speech: ...
+
+def speech_to_text(input_speech: Speech, diarize: bool) -> dict:
+    """Returns: {"text": str, "diarize": any}"""
+
+def isolate_audio(input_speech: Speech) -> Speech: ...
+
+def make_outbound_call(input_speech: Speech, voice_name: str = None) -> bool: ...

@@ -1,0 +1,38 @@
+import torch
+from typing import Union, Sequence, Tuple
+
+Tensor = torch.Tensor
+
+def conv2d(input: Tensor, weight: Tensor, bias: Tensor = None, stride: Union[int, Tuple[int,int]] = 1, padding: Union[int, Tuple[int,int], str] = 0, dilation: Union[int, Tuple[int,int]] = 1, groups: int = 1) -> Tensor:
+    """
+    Shape constraints:
+    - Input: (N, C_in, H_in, W_in)
+    - Weight: (C_out, C_in/groups, kH, kW)
+    - Output: (N, C_out, H_out, W_out)
+    """
+
+def permute(input: Tensor, dims: Tuple[int, ...]) -> Tensor:
+    """Reorders tensor dimensions according to the provided `dims` tuple."""
+
+def split(tensor: Tensor, split_size_or_sections: Union[int, list[int]], dim: int = 0) -> Tuple[Tensor, ...]:
+    """
+    Splits into chunks along `dim`. 
+    - If int: equal sized chunks (last may be smaller).
+    - If list[int]: chunks of specific sizes matching the list.
+    """
+
+def cat(tensors: Sequence[Tensor], dim: int = 0, *, out: Tensor = None) -> Tensor:
+    """Concatenates tensors along `dim`. Tensors must have identical shapes except at `dim`."""
+
+def linear(input: Tensor, weight: Tensor, bias: Tensor = None) -> Tensor:
+    """
+    Applies y = xA^T + b.
+    Shape constraints:
+    - Input: (*, in_features)
+    - Weight: (out_features, in_features)
+    - Bias: (out_features)
+    - Output: (*, out_features)
+    """
+
+def transpose(input: Tensor, dim0: int, dim1: int) -> Tensor:
+    """Swaps `dim0` and `dim1`."""
