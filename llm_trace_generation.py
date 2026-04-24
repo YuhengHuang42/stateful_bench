@@ -1314,6 +1314,99 @@ def reconcile_occurence_book(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _detect_if_condition_variable(
+    program: str,
+    init_local_info: list,
+) -> Optional[str]:
+    """Detect which init variable is used in an ``if X == Y:`` condition.
+
+    Parses *program*'s AST looking for an ``if ... == ...:`` node that
+    has an ``else`` clause and where one side of the comparison is an
+    init variable name from *init_local_info*.
+
+    Returns the variable name, or ``None`` when no suitable condition is
+    found (program has no if-else, or the condition doesn't compare
+    against an init variable).
+    """
+    init_var_names = {item[0] for item in init_local_info}
+
+    try:
+        tree = _ast.parse(program)
+    except SyntaxError:
+        return None
+
+    def _find_if_nodes(stmts):
+        for node in stmts:
+            if isinstance(node, _ast.If):
+                yield node
+            elif isinstance(node, (_ast.For, _ast.While, _ast.With)):
+                yield from _find_if_nodes(node.body)
+
+    for if_node in _find_if_nodes(tree.body):
+        test = if_node.test
+        if not isinstance(test, _ast.Compare):
+            continue
+        if len(test.ops) != 1 or not isinstance(test.ops[0], _ast.Eq):
+            continue
+        if not if_node.orelse:
+            continue
+
+        comparator = test.comparators[0]
+        for side in (test.left, comparator):
+            if isinstance(side, _ast.Name) and side.id in init_var_names:
+                return side.id
+
+    return None
+
+
+def _extract_condition_from_modified_program(
+    modified_program: str,
+    original_condition_info: dict,
+    init_local_info: list,
+) -> Optional[dict]:
+    """Re-extract condition info from a (possibly LLM-modified) program.
+
+    Parses the modified program's AST to find the ``if`` statement and
+    identify which init variable is used in the equality comparison.
+    Falls back to the original ``condition_info`` when the structure is
+    unchanged, and returns ``None`` when the if-else was removed or the
+    condition was restructured beyond recognition.
+
+    Parameters
+    ----------
+    modified_program : str
+        The program body after LLM modification.
+    original_condition_info : dict
+        ``condition_info`` from the fuzzer's ``result`` dict.
+    init_local_info : list
+        ``result["init_block"][1]`` — list of ``(name, value)`` pairs for
+        all init variables, used to verify the condition variable still
+        exists in the init block.
+
+    Returns
+    -------
+    dict or None
+        Updated ``condition_info`` dict with ``if_condition_name``, or
+        ``None`` when the reversed-branch test case should be skipped.
+    """
+    cond_name = _detect_if_condition_variable(modified_program, init_local_info)
+    if cond_name is not None:
+        return {
+            "if_condition_name": cond_name,
+            "if_condition_value": original_condition_info.get("if_condition_value"),
+        }
+
+    # If the original condition variable still exists in the init block and
+    # the program still contains its name textually, accept the original
+    # info as a fallback (the LLM may have only changed branch bodies).
+    init_var_names = {item[0] for item in init_local_info}
+    orig_name = original_condition_info.get("if_condition_name")
+    if orig_name and orig_name in init_var_names and orig_name in modified_program:
+        return original_condition_info
+
+    return None
+
+
 def _build_program_info(result: dict) -> dict:
     """Extract the ``program_info`` dict consumed by evaluators."""
     if result["main_trace"] is None:
@@ -1929,45 +2022,62 @@ def generate_and_collect_with_llm(
                 error_msg=f"Test case collection/evaluation failed after Round 3 repair: {e2}",
             )
 
-    # ── Step 6: Reversed if-else branch (same as the original) ────────
+    # ── Step 6: Reversed if-else branch ─────────────────────────────────
+    # Re-extract the condition from the modified program so that LLM
+    # changes to the if-condition are handled correctly.
     if result["condition_info"] is not None:
-        try:
-            init_local_info_new = copy.deepcopy(result["init_block"][1])
-            match_idx = None
-            for idx, item in enumerate(init_local_info_new):
-                if item[0] == result["condition_info"]["if_condition_name"]:
-                    match_idx = idx
-                    break
-            if match_idx is None:
-                raise ValueError(
-                    f"Condition variable '{result['condition_info']['if_condition_name']}' "
-                    f"not found in init_local_info after LLM modification."
-                )
-            init_local_info_new[match_idx] = (
-                init_local_info_new[match_idx][0],
-                Schema.reverse_if_condition(init_local_info_new[match_idx][1]),
-            )
-            reversed_program_info = {
-                "init_local_str": Schema.return_init_local_info(init_local_info_new)[0],
-                "init_local_info": init_local_info_new,
-                "init_implicit_dict": result["init_implict_dict"],
-                "end_implict_list": effective_program_info["end_implict_list"],
-                "init_load_str": effective_program_info["init_load_str"],
-                "init_load_info": effective_program_info["init_load_info"],
-            }
-            evaluator.collect_test_case(
-                program_info=reversed_program_info,
-                program=modified_program,
-            )
-            pass_list, test_detail = evaluator.evaluate(modified_program)
-            assert pass_list[-1] is True, (
-                f"Reversed test case evaluation failed: "
-                f"{test_detail[-1] if test_detail else 'no detail'}"
-            )
-        except Exception as e:
+        extracted_cond = _extract_condition_from_modified_program(
+            modified_program,
+            original_condition_info=result["condition_info"],
+            init_local_info=result["init_block"][1],
+        )
+        if extracted_cond is None:
             logger.warning(
-                f"Error reversing if-condition after LLM modification: {e}, skip."
+                "Could not re-extract if-condition from modified program "
+                "(LLM may have removed or restructured the branch); "
+                "skipping reversed-branch test case."
             )
+        else:
+            num_cases_before = len(evaluator.test_cases)
+            try:
+                init_local_info_new = copy.deepcopy(result["init_block"][1])
+                match_idx = None
+                for idx, item in enumerate(init_local_info_new):
+                    if item[0] == extracted_cond["if_condition_name"]:
+                        match_idx = idx
+                        break
+                if match_idx is None:
+                    raise ValueError(
+                        f"Condition variable '{extracted_cond['if_condition_name']}' "
+                        f"not found in init_local_info."
+                    )
+                init_local_info_new[match_idx] = (
+                    init_local_info_new[match_idx][0],
+                    Schema.reverse_if_condition(init_local_info_new[match_idx][1]),
+                )
+                reversed_program_info = {
+                    "init_local_str": Schema.return_init_local_info(init_local_info_new)[0],
+                    "init_local_info": init_local_info_new,
+                    "init_implicit_dict": result["init_implict_dict"],
+                    "end_implict_list": effective_program_info["end_implict_list"],
+                    "init_load_str": effective_program_info["init_load_str"],
+                    "init_load_info": effective_program_info["init_load_info"],
+                }
+                evaluator.collect_test_case(
+                    program_info=reversed_program_info,
+                    program=modified_program,
+                )
+                pass_list, test_detail = evaluator.evaluate(modified_program)
+                assert pass_list[-1] is True, (
+                    f"Reversed test case evaluation failed: "
+                    f"{test_detail[-1] if test_detail else 'no detail'}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error reversing if-condition after LLM modification: {e}, skip."
+                )
+                if len(evaluator.test_cases) > num_cases_before:
+                    evaluator.test_cases.pop()
 
     added_changes = _compute_net_diff(original_book, occurence_book)
     return evaluator, True, occurence_book, added_changes, llm_result
@@ -2359,6 +2469,325 @@ def main(
     # -- Save LLM call logs and statistics --
     _save_llm_logs(llm_results_recorder, str(trace_save_path))
     _save_program_intent_summaries(llm_results_recorder, str(trace_save_path))
+
+
+_REVERSED_SKIP_NO_INIT = "no_init_info"
+_REVERSED_SKIP_NO_IFELSE = "no_reversible_if_else"
+_REVERSED_SKIP_NO_MATCH = "cond_var_not_in_init"
+_REVERSED_SKIP_REVERSE_FAIL = "reverse_value_failed"
+_REVERSED_SKIP_COLLECT_FAIL = "collect_or_eval_failed"
+
+
+def _try_add_reversed_branch(
+    evaluator,
+    program: str,
+    program_info: Dict[str, Any],
+    evaluator_label: str = "",
+) -> Tuple[bool, str]:
+    """Attempt to collect a reversed-branch test case for an if-else program.
+
+    Inspects *program* for an ``if X == Y: ... else: ...`` structure,
+    identifies the condition variable in the init block, reverses its
+    value, and collects + validates a new test case.
+
+    Returns ``(success, skip_reason)`` — *skip_reason* is empty on
+    success and a short tag otherwise.
+    """
+    label = f"[{evaluator_label}] " if evaluator_label else ""
+
+    init_local_info = program_info.get("init_local_info")
+    if not init_local_info:
+        return False, _REVERSED_SKIP_NO_INIT
+
+    cond_var = _detect_if_condition_variable(program, init_local_info)
+    if cond_var is None:
+        return False, _REVERSED_SKIP_NO_IFELSE
+
+    match_idx = None
+    for idx, item in enumerate(init_local_info):
+        if item[0] == cond_var:
+            match_idx = idx
+            break
+    if match_idx is None:
+        return False, _REVERSED_SKIP_NO_MATCH
+
+    reversed_init = copy.deepcopy(init_local_info)
+    try:
+        reversed_init[match_idx] = (
+            reversed_init[match_idx][0],
+            Schema.reverse_if_condition(reversed_init[match_idx][1]),
+        )
+    except (ValueError, TypeError) as e:
+        logger.info(f"{label}reverse_if_condition failed for '{cond_var}': {e}")
+        return False, _REVERSED_SKIP_REVERSE_FAIL
+
+    reversed_program_info = copy.deepcopy(program_info)
+    init_str, _ = Schema.return_init_local_info(reversed_init)
+    reversed_program_info["init_local_str"] = init_str
+    reversed_program_info["init_local_info"] = reversed_init
+
+    num_before = len(evaluator.test_cases)
+    try:
+        evaluator.collect_test_case(
+            program_info=reversed_program_info,
+            program=program,
+        )
+        pass_list, _ = evaluator.evaluate(program)
+        assert pass_list[-1] is True
+        return True, ""
+    except Exception as e:
+        logger.info(f"{label}Reversed-branch collect/eval failed: {e}")
+        if len(evaluator.test_cases) > num_before:
+            evaluator.test_cases.pop()
+        return False, _REVERSED_SKIP_COLLECT_FAIL
+
+
+@app.command()
+def regenerate_test_cases(
+    config_file: Annotated[Path, typer.Option()],
+    trace_save_path: Annotated[Path, typer.Option()] = None,
+    output_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=(
+                "Directory to write cleaned evaluator files. "
+                "Defaults to <trace_save_path> (overwrites in place)."
+            ),
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report what would change without writing files."),
+    ] = False,
+    add_reversed: Annotated[
+        bool,
+        typer.Option(
+            "--add-reversed/--no-add-reversed",
+            help=(
+                "After cleanup, try to create reversed-branch test cases "
+                "for evaluators that have only one test case and an "
+                "if-else program. Requires the execution environment "
+                "(session server, torch, voice mock) to be available."
+            ),
+        ),
+    ] = True,
+    recollect: Annotated[
+        bool,
+        typer.Option(
+            "--recollect/--no-recollect",
+            help=(
+                "Instead of deleting failing test cases, re-run "
+                "collect_test_case to capture a fresh oracle from a clean "
+                "environment, then validate the new oracle.  This fixes "
+                "test cases whose oracles were 'contaminated' by residual "
+                "server state at original generation time."
+            ),
+        ),
+    ] = True,
+):
+    """Validate existing evaluator test cases, remove broken ones, and
+    optionally recollect / create missing reversed-branch test cases.
+
+    For every ``evaluator_*.json`` under *trace_save_path*:
+
+    1. Each stored test case is **re-evaluated**: the program is executed
+       with the stored ``program_info`` and the result is compared to the
+       stored oracle.
+    2. Test cases that **fail** the ground-truth check are either
+       **removed** (default) or **recollected** (``--recollect``).
+       Recollection re-runs ``collect_test_case`` with the same
+       ``program_info`` / ``program`` to obtain a fresh oracle, then
+       validates the new test case; if validation still fails, the test
+       case is removed.
+    3. (``--add-reversed``) For evaluators left with exactly one test case
+       whose program contains an ``if X == Y: ... else: ...`` block, a
+       reversed-branch test case is created by flipping the condition
+       variable's init value and re-running collection + validation.
+    4. The cleaned (and optionally augmented) evaluator is written back
+       (or to *output_path*).
+
+    This is useful after LLM-enhancement introduced test cases whose
+    oracles may be inconsistent (e.g. a reversed-branch test case that
+    was appended but never validated, or oracles contaminated by residual
+    server state).
+    """
+    with open(config_file, "r") as f:
+        config_dict = yaml.safe_load(f)
+
+    if trace_save_path is None:
+        trace_save_path = Path(config_dict["env"]["trace_save_path"])
+    else:
+        trace_save_path = Path(trace_save_path)
+
+    if output_path is None:
+        output_path = trace_save_path
+    else:
+        output_path = Path(output_path)
+    os.makedirs(str(output_path), exist_ok=True)
+
+    evaluation_config: Dict[str, Any] = {}
+    if config_dict["task"] == "session":
+        from Sgenerator.session_state import SessionEvaluator
+        evaluator_class = SessionEvaluator
+        evaluation_config["base_url"] = config_dict["env"]["base_url"]
+    elif config_dict["task"] == "tensor":
+        from Sgenerator.tensor_state import TensorEvaluator
+        evaluator_class = TensorEvaluator
+    elif config_dict["task"] == "voice":
+        from Sgenerator.voice_state import VoiceEvaluator
+        evaluator_class = VoiceEvaluator
+    else:
+        raise ValueError(f"Task {config_dict['task']} is not supported.")
+
+    evaluator_files = _discover_existing_evaluator_indices(trace_save_path)
+    if not evaluator_files:
+        logger.info(f"No evaluator files found under {trace_save_path}.")
+        return
+
+    logger.info(
+        f"Found {len(evaluator_files)} evaluator files under {trace_save_path}."
+    )
+
+    total_removed = 0
+    total_kept = 0
+    total_added = 0
+    total_recollected = 0
+    total_evaluators_cleaned = 0
+    removed_detail: Dict[int, List[int]] = {}
+    recollected_detail: Dict[int, List[int]] = {}
+    added_detail: List[int] = []
+    reversed_skip_reasons: Dict[str, List[int]] = {}
+
+    for eidx in tqdm(evaluator_files, desc="Validating evaluators"):
+        eval_path = os.path.join(str(trace_save_path), f"evaluator_{eidx}.json")
+        try:
+            evaluator = evaluator_class.load(eval_path, evaluation_config)
+        except Exception as e:
+            logger.warning(f"Failed to load evaluator_{eidx}.json: {e}, skip.")
+            continue
+
+        if not evaluator.test_cases:
+            continue
+
+        ref_program = evaluator.test_cases[0]["program"]
+
+        try:
+            pass_list, test_detail = evaluator.evaluate(ref_program)
+        except Exception as e:
+            logger.warning(
+                f"evaluator_{eidx}: evaluate() crashed: {e}. "
+                "Marking all test cases as failed."
+            )
+            pass_list = [False] * len(evaluator.test_cases)
+
+        failed_indices = [
+            i for i, passed in enumerate(pass_list) if not passed
+        ]
+
+        if failed_indices:
+            total_evaluators_cleaned += 1
+
+            if recollect and not dry_run:
+                still_failed = []
+                recollected_this = []
+                for fi in failed_indices:
+                    tc = evaluator.test_cases[fi]
+                    tmp_evaluator = evaluator_class(evaluation_config)
+                    try:
+                        new_tc = tmp_evaluator.collect_test_case(
+                            program_info=tc["program_info"],
+                            program=tc["program"],
+                        )
+                        vpass, _ = tmp_evaluator.evaluate(tc["program"])
+                        if vpass[0]:
+                            evaluator.test_cases[fi] = new_tc
+                            recollected_this.append(fi)
+                            logger.info(
+                                f"evaluator_{eidx}: test case {fi} recollected successfully."
+                            )
+                        else:
+                            still_failed.append(fi)
+                            logger.info(
+                                f"evaluator_{eidx}: test case {fi} still fails after recollection."
+                            )
+                    except Exception as e:
+                        still_failed.append(fi)
+                        logger.info(
+                            f"evaluator_{eidx}: recollection of test case {fi} failed: {e}"
+                        )
+
+                if recollected_this:
+                    recollected_detail[eidx] = recollected_this
+                    total_recollected += len(recollected_this)
+
+                if still_failed:
+                    removed_detail[eidx] = still_failed
+                    total_removed += len(still_failed)
+                    for fi in sorted(still_failed, reverse=True):
+                        evaluator.test_cases.pop(fi)
+            else:
+                removed_detail[eidx] = failed_indices
+                total_removed += len(failed_indices)
+                for fi in sorted(failed_indices, reverse=True):
+                    evaluator.test_cases.pop(fi)
+
+        # ── Add reversed-branch test case if requested ────────────────
+        if (
+            add_reversed
+            and not dry_run
+            and len(evaluator.test_cases) == 1
+        ):
+            tc = evaluator.test_cases[0]
+            success, skip_reason = _try_add_reversed_branch(
+                evaluator,
+                program=tc["program"],
+                program_info=tc["program_info"],
+                evaluator_label=f"evaluator_{eidx}",
+            )
+            if success:
+                total_added += 1
+                added_detail.append(eidx)
+                logger.info(f"evaluator_{eidx}: added reversed-branch test case.")
+            elif skip_reason:
+                reversed_skip_reasons.setdefault(skip_reason, []).append(eidx)
+
+        total_kept += len(evaluator.test_cases)
+
+        if not dry_run:
+            out_file = os.path.join(str(output_path), f"evaluator_{eidx}.json")
+            if evaluator.test_cases:
+                evaluator.store(out_file)
+            else:
+                logger.warning(
+                    f"evaluator_{eidx}: all test cases removed; deleting file."
+                )
+                if os.path.exists(out_file):
+                    os.remove(out_file)
+
+    # ── Summary ──────────────────────────────────────────────────────
+    summary_parts = [
+        f"{total_kept} test cases kept",
+        f"{total_removed} removed across {total_evaluators_cleaned} evaluators",
+    ]
+    if recollect:
+        summary_parts.append(f"{total_recollected} recollected")
+    if add_reversed:
+        summary_parts.append(f"{total_added} reversed-branch test cases added")
+    logger.info(f"Regeneration complete: {', '.join(summary_parts)}.")
+    if recollected_detail:
+        for eidx, indices in sorted(recollected_detail.items()):
+            logger.info(f"  evaluator_{eidx}: recollected test case indices {indices}")
+    if removed_detail:
+        for eidx, indices in sorted(removed_detail.items()):
+            logger.info(f"  evaluator_{eidx}: removed test case indices {indices}")
+    if added_detail:
+        logger.info(f"  Added reversed-branch test cases to evaluators: {added_detail}")
+    if reversed_skip_reasons:
+        logger.info("  Reversed-branch skip breakdown:")
+        for reason, indices in sorted(reversed_skip_reasons.items()):
+            logger.info(f"    {reason}: {len(indices)} evaluators — {indices}")
+    if dry_run:
+        logger.info("(dry-run mode — no files were written)")
 
 
 if __name__ == "__main__":

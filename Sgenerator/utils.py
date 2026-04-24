@@ -101,13 +101,27 @@ def generate_jsonl_for_openai(request_id_list,
     for idx, item in enumerate(request_id_list):
         request_id = item
         message = message_list[idx]
-        body = {"model": model_type, 
-         "messages": message
-        }
+        is_responses_api = str(url).strip().rstrip("/").endswith("/responses")
+        if is_responses_api:
+            body = {
+                "model": model_type,
+                "input": message,
+            }
+        else:
+            body = {
+                "model": model_type,
+                "messages": message,
+            }
         if max_tokens is not None:
-            body["max_tokens"] = max_tokens
+            if is_responses_api:
+                body["max_output_tokens"] = max_tokens
+            else:
+                body["max_tokens"] = max_tokens
         if response_format is not None:
-            body["response_format"] = response_format
+            if is_responses_api:
+                body["text"] = {"format": response_format}
+            else:
+                body["response_format"] = response_format
         per_request = {
             "custom_id": request_id,
             "method": "POST",

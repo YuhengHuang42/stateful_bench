@@ -14,6 +14,7 @@ from loguru import logger
 import copy
 import os
 import json
+import ast
 import filelock
 import traceback
 from pathlib import Path
@@ -941,7 +942,7 @@ class ProgramEvaluator(ABC):
         pass
 
     @abstractmethod
-    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
+    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None, end_implict_list=None):
         """Prepare testing environment with initial states"""
         pass
 
@@ -1243,29 +1244,39 @@ def generate_and_collect_test_case(
     
     if result["condition_info"] is not None:
         init_local_info_new = copy.deepcopy(result["init_block"][1])
-        idx = None
+        match_idx = None
         for idx, item in enumerate(init_local_info_new):
             if item[0] == result["condition_info"]["if_condition_name"]:
+                match_idx = idx
                 break
-        init_local_info_new[idx] = (init_local_info_new[idx][0], Schema.reverse_if_condition(init_local_info_new[idx][1]))
-        init_local_str_new = Schema.return_init_local_info(init_local_info_new)[0]
-        program_info = {
-            "init_local_str": init_local_str_new,
-            "init_local_info": init_local_info_new,
-            "init_implicit_dict": result['init_implict_dict'],
-            "end_implict_list": implict_list,
-            "init_load_str": result["init_load_info"][0] if result["init_load_info"] is not None else None,
-            "init_load_info": result["init_load_info"][1] if result["init_load_info"] is not None else None
-        }
-        try:
-            evaluator.collect_test_case(
-                program_info = program_info,
-                program = result['program']
+        if match_idx is None:
+            logger.warning(
+                f"Condition variable '{result['condition_info']['if_condition_name']}' "
+                f"not found in init_local_info, skip reversed branch."
             )
-            pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
-            assert pass_list[0] == True
-        except Exception as e:
-            logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip this test case.")
+        else:
+            init_local_info_new[match_idx] = (init_local_info_new[match_idx][0], Schema.reverse_if_condition(init_local_info_new[match_idx][1]))
+            init_local_str_new = Schema.return_init_local_info(init_local_info_new)[0]
+            program_info = {
+                "init_local_str": init_local_str_new,
+                "init_local_info": init_local_info_new,
+                "init_implicit_dict": result['init_implict_dict'],
+                "end_implict_list": implict_list,
+                "init_load_str": result["init_load_info"][0] if result["init_load_info"] is not None else None,
+                "init_load_info": result["init_load_info"][1] if result["init_load_info"] is not None else None
+            }
+            num_cases_before = len(evaluator.test_cases)
+            try:
+                evaluator.collect_test_case(
+                    program_info = program_info,
+                    program = result['program']
+                )
+                pass_list, test_case_pass_detail = evaluator.evaluate(result['program'])
+                assert pass_list[-1] is True
+            except Exception as e:
+                logger.warning(f"Error in generating and collecting test case: {e} when reversing the if condition, skip this test case.")
+                if len(evaluator.test_cases) > num_cases_before:
+                    evaluator.test_cases.pop()
         
     return evaluator, is_success, occurence_book, added_changes
 
@@ -1273,19 +1284,43 @@ def generate_and_collect_test_case(
 LLM_EVAL_PROMPT = '''You are provided with API documentation and task-specific instructions. Based on this information, generate the corresponding code to fulfill the task requirements.'''
 
 
-def _extract_preloaded_variable_names_from_program_info(program_info: dict) -> List[str]:
-    """Extract preloaded variable names from serialized evaluator program_info."""
-    names: List[str] = []
+def _infer_basic_structure_type(value: Any) -> Optional[str]:
+    """Return a basic structure type label when inferable (dict/list/tuple/set)."""
+    parsed = value
+    if isinstance(parsed, str):
+        txt = parsed.strip()
+        if txt:
+            try:
+                parsed = json.loads(txt)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    parsed = ast.literal_eval(txt)
+                except (SyntaxError, ValueError):
+                    parsed = value
+    if isinstance(parsed, dict):
+        return "dict"
+    if isinstance(parsed, list):
+        return "list"
+    if isinstance(parsed, tuple):
+        return "tuple"
+    if isinstance(parsed, set):
+        return "set"
+    return None
+
+
+def _extract_preloaded_variable_names_from_program_info(program_info: dict) -> List[Tuple[str, Optional[str]]]:
+    """Extract preloaded variable names (and basic types) from evaluator program_info."""
+    names: List[Tuple[str, Optional[str]]] = []
     seen = set()
 
-    def _add(name: Any):
+    def _add(name: Any, value: Any = None):
         if not isinstance(name, str):
             return
         n = name.strip()
         if not n or n in seen:
             return
         seen.add(n)
-        names.append(n)
+        names.append((n, _infer_basic_structure_type(value)))
 
     if not isinstance(program_info, dict):
         return names
@@ -1293,17 +1328,19 @@ def _extract_preloaded_variable_names_from_program_info(program_info: dict) -> L
     # init_local_info shape is typically: [(name, value), ...]
     for item in program_info.get("init_local_info") or []:
         if isinstance(item, (list, tuple)) and len(item) >= 1:
-            _add(item[0])
+            val = item[1] if len(item) >= 2 else None
+            _add(item[0], val)
 
     # init_load_info shape is typically: [(name, value), ...]
     for item in program_info.get("init_load_info") or []:
         if isinstance(item, (list, tuple)) and len(item) >= 1:
-            _add(item[0])
+            val = item[1] if len(item) >= 2 else None
+            _add(item[0], val)
 
     return names
 
 
-def _extract_preloaded_variable_names_from_evaluator(evaluator: Any) -> List[str]:
+def _extract_preloaded_variable_names_from_evaluator(evaluator: Any) -> List[Tuple[str, Optional[str]]]:
     """Extract representative preloaded variable names from the evaluator test cases."""
     test_cases = getattr(evaluator, "test_cases", None)
     if not isinstance(test_cases, list) or len(test_cases) == 0:
@@ -1315,10 +1352,13 @@ def _extract_preloaded_variable_names_from_evaluator(evaluator: Any) -> List[str
     return _extract_preloaded_variable_names_from_program_info(program_info)
 
 
-def _format_preloaded_variable_names_block(variable_names: List[str]) -> str:
+def _format_preloaded_variable_names_block(variable_names: List[Tuple[str, Optional[str]]]) -> str:
     if len(variable_names) == 0:
         return ""
-    items = "\n".join(f"- {name}" for name in variable_names)
+    items = "\n".join(
+        f"- {name} ({basic_type})" if basic_type else f"- {name}"
+        for name, basic_type in variable_names
+    )
     return (
         "\n\n===Preloaded variable names===:\n"
         "The following variable names are preloaded at runtime and can be used directly:\n"
@@ -1357,6 +1397,36 @@ def _normalize_instruction_text(instruction_inner: Any) -> str:
             return "\n".join(parts).strip()
         return str(value).strip()
 
+    def _split_section_like_text(text: str) -> Optional[Tuple[str, str]]:
+        """Split plain text that contains user/task headings (tagged or untagged)."""
+        t = (text or "").strip()
+        if not t:
+            return None
+
+        # Accept both "<User Variable Definition>" and "User Variable Definition"
+        # (same for task instructions), with optional plural/suffix colon.
+        user_pat = re.compile(
+            r"(?im)^\s*(?:<\s*)?user\s*variable\s*definitions?(?:\s*>\s*|\s*:?\s*)$"
+        )
+        task_pat = re.compile(
+            r"(?im)^\s*(?:<\s*)?task\s*instructions?(?:\s*>\s*|\s*:?\s*)$"
+        )
+        um = user_pat.search(t)
+        tm = task_pat.search(t)
+        if not um or not tm:
+            return None
+
+        if um.start() < tm.start():
+            user_body = t[um.end():tm.start()].strip()
+            task_body = t[tm.end():].strip()
+        else:
+            task_body = t[tm.end():um.start()].strip()
+            user_body = t[um.end():].strip()
+
+        if not user_body and not task_body:
+            return None
+        return user_body, task_body
+
     payload: Any = instruction_inner
     if isinstance(payload, str):
         text = payload.strip()
@@ -1390,14 +1460,25 @@ def _normalize_instruction_text(instruction_inner: Any) -> str:
             if sections:
                 return "\n\n".join(sections).strip()
 
-    return _as_text(instruction_inner)
+    plain = _as_text(instruction_inner)
+    split = _split_section_like_text(plain)
+    if split is not None:
+        user_defs_text, task_text = split
+        sections: List[str] = []
+        if user_defs_text:
+            sections.append(f"<User Variable Definition>\n{user_defs_text}")
+        if task_text:
+            sections.append(f"<Task Instructions>\n{task_text}")
+        if sections:
+            return "\n\n".join(sections).strip()
+    return plain
 
 
 def _assemble_llm_eval_prompt(
     doc: str,
     instruction_inner: str,
     task_specific_prompt: str,
-    preloaded_variable_names: Optional[List[str]] = None,
+    preloaded_variable_names: Optional[List[Tuple[str, Optional[str]]]] = None,
 ) -> str:
     """Same full prompt shape as `StateEval` builds from agent_data (used by StateEvalHF rows with agent_data)."""
     return (

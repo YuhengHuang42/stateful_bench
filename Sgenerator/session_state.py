@@ -39,6 +39,15 @@ response_4 = requests.get(url)
 Your code:
 '''
 
+def _inject_base_url_placeholder(program: str, base_url: str) -> str:
+    """
+    Robustly substitute BASE_URL placeholders in generated code.
+    Models sometimes emit ``{{BASE_URL}}`` inside f-strings; normalize first so
+    replacement does not produce invalid code like ``f"{http://...}"``.
+    """
+    normalized_program = re.sub(r"\{\{\s*BASE_URL\s*\}\}", "{BASE_URL}", program)
+    return normalized_program.replace("{BASE_URL}", base_url)
+
 class SessionType(str, Enum):
     MAIN_SESSION = "main_session"
     VIRTUAL_STUDY = "virtual_study"
@@ -1826,7 +1835,7 @@ class SessionEvaluator(ProgramEvaluator):
         with open(file_path, "w") as f:
             json.dump(saved_info, f)
             
-    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None):
+    def prepare_environment(self, init_implicit_dict, init_local_info, init_load_info=None, end_implict_list=None):
         # init_load_info not used for SessionEvaluator
         source_type_pair = [set([]), set([])]
         for idx in init_implicit_dict:
@@ -1843,19 +1852,19 @@ class SessionEvaluator(ProgramEvaluator):
                 if item_data["source"] is not None and item_data["type"] is not None:
                     source_type_pair[0].add(item_data["source"])
                     source_type_pair[1].add(item_data["type"])
-            
+
+        if end_implict_list:
+            for state in end_implict_list:
+                source_type_pair[0].add(state["source"])
+                source_type_pair[1].add(state["type"])
+
         for source in list(source_type_pair[0]):
             for type in list(source_type_pair[1]):
-                # It is O(n^2)
-                # But it has to be done since in the middle of the program, the source and type might be changed.
-                # And a pair that never exists in the init environment might be created.
-                # So we have to clean up all the sessions with the recorded source and type.
                 url = f"{self.config['base_url']}/api/sessions/{source}/{type}"
                 response = requests.get(url)
                 response.raise_for_status()
                 response_json = response.json()
                 if len(response_json) > 0:
-                    # Delete all existing sessions with the recorded source and type
                     for session in response_json:
                         delete_session = requests.delete(
                             url = f"{url}/{session['id']}"
@@ -1893,10 +1902,15 @@ class SessionEvaluator(ProgramEvaluator):
         '''
         complete_program = program_info["init_local_str"] + program
         namespace = {}
-        complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
+        complete_program = _inject_base_url_placeholder(complete_program, self.config['base_url'])
         complete_program = self.local_environment_str + "\n" + complete_program
         
-        self.prepare_environment(program_info['init_implicit_dict'], program_info['init_local_info'], program_info["init_load_info"])
+        self.prepare_environment(
+            program_info['init_implicit_dict'],
+            program_info['init_local_info'],
+            program_info["init_load_info"],
+            end_implict_list=program_info.get("end_implict_list"),
+        )
         exec(complete_program, namespace)
         
         # Collect States
@@ -1940,10 +1954,14 @@ class SessionEvaluator(ProgramEvaluator):
         test_case_pass_detail = []
         for idx, test_case in enumerate(self.test_cases):
             result_pass = True
-            self.prepare_environment(test_case["program_info"]["init_implicit_dict"], test_case["program_info"]["init_local_info"])
+            self.prepare_environment(
+                test_case["program_info"]["init_implicit_dict"],
+                test_case["program_info"]["init_local_info"],
+                end_implict_list=test_case["program_info"].get("end_implict_list"),
+            )
             complete_program = test_case["program_info"]["init_local_str"] + program
             namespace = {}
-            complete_program = complete_program.replace("{BASE_URL}", self.config['base_url'])
+            complete_program = _inject_base_url_placeholder(complete_program, self.config['base_url'])
             complete_program = self.local_environment_str + "\n" + complete_program
             try:
                 exec(complete_program, namespace)
