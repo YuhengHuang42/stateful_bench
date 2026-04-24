@@ -15,6 +15,7 @@ import os
 from tqdm import tqdm
 import numpy as np
 
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
@@ -22,7 +23,7 @@ except ImportError:  # pragma: no cover
 # StateEval: parent_path: str, task: str, config_dict: dict, api_doc: str
 
 from Sgenerator.utils import generate_jsonl_for_openai, submit_batch_request_openai
-
+DEFAULT_MAX_TOKENS = 16384
 
 app = typer.Typer(pretty_exceptions_show_locals=False, pretty_exceptions_short=False)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -89,6 +90,87 @@ def _openai_batch_supported(base_url: Optional[str]) -> bool:
         return True
     u = base_url.strip().rstrip("/").lower()
     return u in ("https://api.openai.com/v1", "http://api.openai.com/v1")
+
+def _is_responses_api(url: str) -> bool:
+    return str(url).strip().rstrip("/").endswith("/responses")
+
+
+def _extract_text_from_response_payload(payload):
+    """Best-effort extraction for both chat.completions and responses APIs."""
+    def _flatten_content_text(content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_chunks = []
+            for part in content:
+                if isinstance(part, str):
+                    text_chunks.append(part)
+                elif isinstance(part, dict):
+                    txt = part.get("text")
+                    if isinstance(txt, str):
+                        text_chunks.append(txt)
+                else:
+                    txt = getattr(part, "text", None)
+                    if isinstance(txt, str):
+                        text_chunks.append(txt)
+            if text_chunks:
+                return "\n".join(text_chunks)
+        return ""
+
+    if payload is None:
+        return ""
+    # 1) OpenAI Python responses API convenience field.
+    output_text = getattr(payload, "output_text", None)
+    if isinstance(output_text, str) and output_text:
+        return output_text
+    # 2) Chat completions-like shape.
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        flattened = _flatten_content_text(content)
+        if flattened:
+            return flattened
+    except Exception:
+        pass
+    # 2b) Object access for chat.completions SDK objects.
+    try:
+        choices = getattr(payload, "choices", [])
+        if choices:
+            message = getattr(choices[0], "message", None)
+            if message is not None:
+                content = getattr(message, "content", None)
+                flattened = _flatten_content_text(content)
+                if flattened:
+                    return flattened
+    except Exception:
+        pass
+    # 3) Responses-like nested shape.
+    try:
+        output = payload.get("output", [])
+        text_chunks = []
+        for item in output:
+            for c in item.get("content", []):
+                txt = c.get("text")
+                if isinstance(txt, str):
+                    text_chunks.append(txt)
+        if text_chunks:
+            return "\n".join(text_chunks)
+    except Exception:
+        pass
+    # 4) Object access for responses SDK objects.
+    try:
+        output = getattr(payload, "output", [])
+        text_chunks = []
+        for item in output:
+            contents = getattr(item, "content", [])
+            for c in contents:
+                txt = getattr(c, "text", None)
+                if isinstance(txt, str):
+                    text_chunks.append(txt)
+        if text_chunks:
+            return "\n".join(text_chunks)
+    except Exception:
+        pass
+    return ""
 
 
 def extract_code(text: str) -> str:
@@ -263,7 +345,7 @@ def main(
     max_tokens: Annotated[
         Optional[int],
         typer.Option(help="Max completion tokens for chat (non-batch) OpenAI-compatible calls."),
-    ] = 8192,
+    ] = DEFAULT_MAX_TOKENS,
     print_prompt_sample: Annotated[
         bool,
         typer.Option(
@@ -323,7 +405,7 @@ def main(
     prompt_message_list = []
     code_message_list = []
     message_list = []
-    if "gpt" in target_llm:
+    if ("gpt" in target_llm) or ("claude" in target_llm):
         # OPENAI-compatible mode (official OpenAI Batch API or per-request chat.completions)
         compat_base, compat_api_key = _resolve_openai_compat_credentials(env_config, base_url)
         eval_batch_mode = _resolve_eval_batch_mode(env_config, batch_mode)
@@ -333,7 +415,7 @@ def main(
             if te is not None and str(te).strip():
                 chat_max_tokens = int(te)
             else:
-                chat_max_tokens = int(env_config.get("eval_max_tokens", 4096))
+                chat_max_tokens = int(env_config.get("eval_max_tokens", DEFAULT_MAX_TOKENS))
         if not compat_api_key:
             raise ValueError(
                 "Missing API key for OpenAI-compatible evaluation. Set API_KEY/OPENAI_API_KEY "
@@ -388,7 +470,9 @@ def main(
             for i in file_response.iter_lines():
                 info = json.loads(i)
                 raw_message_list.append(info)
-                code = extract_code(info["response"]["body"]["choices"][0]["message"]["content"])
+                response_body = info.get("response", {}).get("body", {})
+                content = _extract_text_from_response_payload(response_body)
+                code = extract_code(content)
                 custom_id = info["custom_id"]
                 item_id = int(custom_id.split("_")[1])
                 code_message_list.append({
@@ -405,14 +489,22 @@ def main(
         else:
             raw_message_list = []
             for idx, messages in enumerate(
-                tqdm(message_list, desc="Evaluating (chat completions)")
+                tqdm(message_list, desc="Evaluating (sync completions)")
             ):
-                response = client.chat.completions.create(
-                    model=target_llm,
-                    messages=messages,
-                    max_tokens=chat_max_tokens,
-                )
-                content = response.choices[0].message.content or ""
+                if _is_responses_api(openai_url):
+                    response = client.responses.create(
+                        model=target_llm,
+                        input=messages,
+                        max_output_tokens=chat_max_tokens,
+                    )
+                    content = _extract_text_from_response_payload(response)
+                else:
+                    response = client.chat.completions.create(
+                        model=target_llm,
+                        messages=messages,
+                        max_tokens=chat_max_tokens,
+                    )
+                    content = _extract_text_from_response_payload(response)
                 info = {
                     "custom_id": request_id_list[idx],
                     "response": {
@@ -471,7 +563,7 @@ def main(
             response = client.completions.create(
                 prompt=prompt,
                 model=target_llm,
-                max_tokens=4096,
+                max_tokens=DEFAULT_MAX_TOKENS,
             )
             code = extract_code(response.choices[0].text)
             message_list.append(response.choices[0].text)
