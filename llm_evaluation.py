@@ -161,6 +161,18 @@ def _is_responses_api(url: str) -> bool:
     return str(url).strip().rstrip("/").endswith("/responses")
 
 
+def _should_retry_llm_with_max_completion_tokens(error_text: str) -> bool:
+    """Detect providers requiring max_completion_tokens instead of max_tokens."""
+    if not error_text:
+        return False
+    t = error_text.lower()
+    return (
+        "max_completion_tokens" in error_text
+        and "max_tokens" in error_text
+        and ("unsupported" in t or "invalid_request" in t or "not supported" in t)
+    )
+
+
 def _extract_text_from_response_payload(payload):
     """Best-effort extraction for both chat.completions and responses APIs."""
     def _flatten_content_text(content):
@@ -258,6 +270,69 @@ def _serialize_openai_payload(payload):
         return {"_raw_repr": repr(payload)}
 
 
+def _extract_choice_error(payload_dict: dict) -> Optional[str]:
+    """Return provider-side choice error text (if present) from chat payload."""
+    if not isinstance(payload_dict, dict):
+        return None
+    try:
+        choices = payload_dict.get("choices", [])
+        if not choices:
+            return None
+        first = choices[0]
+        if not isinstance(first, dict):
+            return None
+        err = first.get("error")
+        if not isinstance(err, dict):
+            return None
+        code = err.get("code")
+        msg = err.get("message")
+        meta = err.get("metadata")
+        provider = payload_dict.get("provider")
+        return (
+            f"provider={provider}, code={code}, message={msg}, metadata={meta}"
+        )
+    except Exception:
+        return None
+
+
+def _chat_completion_with_retry(
+    client,
+    target_llm: str,
+    messages: list,
+    chat_max_tokens: int,
+):
+    """
+    Call chat.completions once and fail on any provider-side payload error.
+    Keeps max_tokens -> max_completion_tokens fallback for compatibility.
+    """
+    kwargs = {
+        "model": target_llm,
+        "messages": messages,
+        "max_tokens": chat_max_tokens,
+    }
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        if _should_retry_llm_with_max_completion_tokens(str(e)):
+            kwargs.pop("max_tokens", None)
+            kwargs["max_completion_tokens"] = chat_max_tokens
+            logger.warning(
+                "Provider rejected max_tokens; retrying with "
+                "max_completion_tokens."
+            )
+            response = client.chat.completions.create(**kwargs)
+        else:
+            raise
+
+    body = _serialize_openai_payload(response)
+    choice_error = _extract_choice_error(body)
+    if choice_error is not None:
+        raise RuntimeError(
+            f"Provider returned choice-level error payload: {choice_error}"
+        )
+    return response
+
+
 def _log_response_diagnostics(raw_message_list):
     """Summarize finish reasons and suspiciously short outputs."""
     if not raw_message_list:
@@ -268,16 +343,29 @@ def _log_response_diagnostics(raw_message_list):
     for item in raw_message_list:
         body = item.get("response", {}).get("body", {})
         finish_reason = None
+        completion_tokens = None
+        prompt_tokens = None
         try:
             choices = body.get("choices", [])
             if choices:
                 finish_reason = choices[0].get("finish_reason")
         except Exception:
             finish_reason = None
+        try:
+            usage = body.get("usage", {}) if isinstance(body, dict) else {}
+            completion_tokens = usage.get("completion_tokens")
+            prompt_tokens = usage.get("prompt_tokens")
+        except Exception:
+            completion_tokens = None
+            prompt_tokens = None
         finish_reason = str(finish_reason)
         finish_reason_counts[finish_reason] = finish_reason_counts.get(finish_reason, 0) + 1
         content = _extract_text_from_response_payload(body)
         content_len_list.append(len(content or ""))
+        if isinstance(completion_tokens, int):
+            item.setdefault("_diag", {})["completion_tokens"] = completion_tokens
+        if isinstance(prompt_tokens, int):
+            item.setdefault("_diag", {})["prompt_tokens"] = prompt_tokens
 
     n = len(content_len_list)
     short_count = sum(1 for x in content_len_list if x < 64)
@@ -297,6 +385,28 @@ def _log_response_diagnostics(raw_message_list):
         logger.warning(
             f"{zero_count}/{n} responses are empty after extraction. "
             "Check raw_message_list response bodies for provider-specific schema."
+        )
+    completion_token_list = [
+        item.get("_diag", {}).get("completion_tokens")
+        for item in raw_message_list
+        if isinstance(item.get("_diag", {}).get("completion_tokens"), int)
+    ]
+    prompt_token_list = [
+        item.get("_diag", {}).get("prompt_tokens")
+        for item in raw_message_list
+        if isinstance(item.get("_diag", {}).get("prompt_tokens"), int)
+    ]
+    if completion_token_list:
+        logger.info(
+            f"Completion token stats: min={min(completion_token_list)}, "
+            f"median={int(np.median(completion_token_list))}, "
+            f"max={max(completion_token_list)}"
+        )
+    if prompt_token_list:
+        logger.info(
+            f"Prompt token stats: min={min(prompt_token_list)}, "
+            f"median={int(np.median(prompt_token_list))}, "
+            f"max={max(prompt_token_list)}"
         )
 
 
@@ -584,7 +694,6 @@ def main(
             f"base_url={compat_base or '[default OpenAI]'}, batch_mode={eval_batch_mode}, "
             f"max_tokens={chat_max_tokens}"
         )
-
         request_id_list = []
         for idx, prompt in enumerate(stateful_bench):
             if idx >= first_n and first_n > 0:
@@ -650,10 +759,11 @@ def main(
                     )
                     content = _extract_text_from_response_payload(response)
                 else:
-                    response = client.chat.completions.create(
-                        model=target_llm,
+                    response = _chat_completion_with_retry(
+                        client=client,
+                        target_llm=target_llm,
                         messages=messages,
-                        max_tokens=chat_max_tokens,
+                        chat_max_tokens=chat_max_tokens,
                     )
                 body = _serialize_openai_payload(response)
                 content = _extract_text_from_response_payload(body)
