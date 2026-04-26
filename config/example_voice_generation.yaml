@@ -1,21 +1,41 @@
 task: "voice"
+
 env:
+  # Output folders for generated voice traces and agent logs.
   trace_save_path: "/data/stateful_bench/voice"
   agent_save_path: "/data/stateful_bench/voice/agent_data"
+
+  # Fill keys for your selected LLM provider(s).
   openai_api_key: ""
   open_source_api_key: ""
-  open_source_base_url: ""
+  open_source_base_url: "https://api.lambda.ai/v1"
   google_api_key: ""
 
 generation_config:
+  # Voice API documentation and simplified prompt context.
+  api_doc_file: "api_doc/voice_generation.md"
+  api_doc_file_simplified: "api_doc/speechlab-simplified.txt"
+  use_api_structured_output: true
+
+  # Fraction of generated traces to mutate/rewrite.
+  modification_ratio: 0.3
+
+  # Number of traces and API calls per trace.
   num_of_tests: 60
   num_of_apis: 5
-  control_position_candidate: [1, 2, 3, 4] # When idx == 4, it means no control flow.
+
+  # 4 means "no explicit control-flow block".
+  control_position_candidate: [1, 2, 3, 4]
+
   trace_config:
+    # Initial counts of text/voice states in synthesized traces.
     init_text_range: [1, 2]
     init_voice_range: [1, 2]
+    # Upper bound for total initial states.
     max_init_state_num: 3
 
 agent_config:
+  # Retry budget for agent repair iterations.
   max_iterations: 3
-  
+  batch_mode: false
+  temperature: 1.0

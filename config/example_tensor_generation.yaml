@@ -1,19 +1,38 @@
 task: "tensor"
+
 env:
+  # Output folders for traces and agent execution artifacts.
   trace_save_path: "/data/stateful_bench/tensor"
   agent_save_path: "/data/stateful_bench/tensor/agent_data"
+
+  # Fill keys for the provider(s) you plan to use.
   openai_api_key: ""
   open_source_api_key: ""
-  open_source_base_url: ""
+  open_source_base_url: "https://api.lambda.ai/v1"
   google_api_key: ""
 
 generation_config:
+  # API/function references used to build tensor workflows.
+  api_doc_file: "api_doc/tensor_manipulation.md"
+  api_doc_file_simplified: "api_doc/tensor_manipulation-simplified.txt"
+  use_api_structured_output: true
+
+  # Fraction of generated traces that get modification passes.
+  modification_ratio: 0.3
+
+  # Workload size and per-trace API complexity.
   num_of_tests: 60
   num_of_apis: 5
-  control_position_candidate: [1, 2, 3, 4] # When idx == 4, it means no control flow.
+
+  # 4 means "no explicit control flow".
+  control_position_candidate: [1, 2, 3, 4]
+
   trace_config:
+    # Initial tensor/local variable count before API chaining.
     init_local_state_num_range: [1, 2]
 
 agent_config:
+  # Repair/regeneration attempts for each test case.
   max_iterations: 3
-  
+  batch_mode: false
+  temperature: 1.0
