@@ -68,6 +68,65 @@ def _resolve_openai_compat_credentials(env_config: dict, cli_base_url: Optional[
     return base_url, api_key
 
 
+def _resolve_openrouter_credentials(env_config: dict, cli_base_url: Optional[str]):
+    """
+    Resolve OpenRouter connection settings.
+    Priority:
+      - base_url: CLI override -> OPENROUTER_BASE_URL -> default OpenRouter endpoint
+      - api_key: OPENROUTER_API_KEY -> config env.openrouter_api_key
+    """
+    base_url = cli_base_url
+    if base_url is None:
+        base_url = os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+    if base_url is not None and str(base_url).strip() == "":
+        base_url = "https://openrouter.ai/api/v1"
+    api_key = os.environ.get("OPENROUTER_API_KEY") or env_config.get("openrouter_api_key", "")
+    return base_url, api_key
+
+
+def _resolve_openrouter_headers(env_config: dict) -> dict:
+    """
+    Optional OpenRouter attribution headers.
+    See: https://openrouter.ai/docs
+    """
+    referer = os.environ.get("OPENROUTER_SITE_URL") or env_config.get("openrouter_site_url")
+    title = os.environ.get("OPENROUTER_APP_NAME") or env_config.get("openrouter_app_name")
+    headers = {}
+    if referer:
+        headers["HTTP-Referer"] = str(referer)
+    if title:
+        headers["X-Title"] = str(title)
+    return headers
+
+
+def _should_use_openai_compat(target_llm: str, cli_base_url: Optional[str]) -> bool:
+    """
+    Route OpenAI-compatible model ids (including provider/model forms like tensorblock/*)
+    to the OpenAI-compatible client branch.
+    """
+    model = str(target_llm).strip().lower()
+    if ("gpt" in model) or ("claude" in model):
+        return True
+    if cli_base_url is not None and str(cli_base_url).strip():
+        return True
+    # Provider-prefixed ids are typically served via OpenAI-compatible gateways.
+    if "/" in model and not model.startswith("models/"):
+        return True
+    return False
+
+
+def _is_openrouter_model(target_llm: str) -> bool:
+    """
+    Heuristic for common OpenRouter model-id patterns:
+    - provider/model (e.g. deepseek/deepseek-v3.2)
+    - explicit openrouter namespace
+    """
+    model = str(target_llm).strip().lower()
+    if model.startswith("openrouter/"):
+        return True
+    return "/" in model and not model.startswith("models/")
+
+
 def _safe_artifact_tag(model: str) -> str:
     """Model ids may contain slashes (e.g. provider/model); strip for filesystem-safe filenames."""
     s = model.strip()
@@ -79,6 +138,13 @@ def _safe_artifact_tag(model: str) -> str:
 def _ensure_parent_dir(path: Union[str, os.PathLike]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _persist_result(path: Union[str, os.PathLike], result: dict) -> None:
+    """Best-effort persistence helper used for crash-safe checkpoints."""
+    _ensure_parent_dir(path)
+    with open(path, "wb") as file:
+        pickle.dump(result, file)
 
 
 def _openai_batch_supported(base_url: Optional[str]) -> bool:
@@ -171,6 +237,67 @@ def _extract_text_from_response_payload(payload):
     except Exception:
         pass
     return ""
+
+
+def _serialize_openai_payload(payload):
+    """Convert SDK response objects to plain dicts for durable logging."""
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    # OpenAI SDK objects expose model_dump(); keep a broad fallback.
+    try:
+        dumped = payload.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    except Exception:
+        pass
+    try:
+        return dict(payload)
+    except Exception:
+        return {"_raw_repr": repr(payload)}
+
+
+def _log_response_diagnostics(raw_message_list):
+    """Summarize finish reasons and suspiciously short outputs."""
+    if not raw_message_list:
+        logger.warning("No raw responses captured.")
+        return
+    finish_reason_counts = {}
+    content_len_list = []
+    for item in raw_message_list:
+        body = item.get("response", {}).get("body", {})
+        finish_reason = None
+        try:
+            choices = body.get("choices", [])
+            if choices:
+                finish_reason = choices[0].get("finish_reason")
+        except Exception:
+            finish_reason = None
+        finish_reason = str(finish_reason)
+        finish_reason_counts[finish_reason] = finish_reason_counts.get(finish_reason, 0) + 1
+        content = _extract_text_from_response_payload(body)
+        content_len_list.append(len(content or ""))
+
+    n = len(content_len_list)
+    short_count = sum(1 for x in content_len_list if x < 64)
+    zero_count = sum(1 for x in content_len_list if x == 0)
+    logger.info(f"Response finish_reason counts: {finish_reason_counts}")
+    logger.info(
+        f"Response content length stats: min={min(content_len_list)}, "
+        f"median={int(np.median(content_len_list))}, max={max(content_len_list)}, n={n}"
+    )
+    if short_count / max(1, n) >= 0.5:
+        logger.warning(
+            f"{short_count}/{n} responses are shorter than 64 chars. "
+            "This often indicates provider-side truncation, stop-sequence mismatch, "
+            "or incompatible max_tokens handling."
+        )
+    if zero_count > 0:
+        logger.warning(
+            f"{zero_count}/{n} responses are empty after extraction. "
+            "Check raw_message_list response bodies for provider-specific schema."
+        )
 
 
 def extract_code(text: str) -> str:
@@ -335,6 +462,13 @@ def main(
         Optional[str],
         typer.Option(help="OpenAI-compatible API base (e.g. https://api.openai.com/v1). Overrides BASE_URL / config env.open_source_base_url."),
     ] = None,
+    openrouter: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--openrouter/--no-openrouter",
+            help="Force OpenRouter mode. Uses OPENROUTER_API_KEY (or env.openrouter_api_key) and defaults base_url to https://openrouter.ai/api/v1.",
+        ),
+    ] = None,
     batch_mode: Annotated[
         Optional[bool],
         typer.Option(
@@ -405,9 +539,21 @@ def main(
     prompt_message_list = []
     code_message_list = []
     message_list = []
-    if ("gpt" in target_llm) or ("claude" in target_llm):
+    if _should_use_openai_compat(target_llm, base_url):
         # OPENAI-compatible mode (official OpenAI Batch API or per-request chat.completions)
-        compat_base, compat_api_key = _resolve_openai_compat_credentials(env_config, base_url)
+        use_openrouter = bool(openrouter) if openrouter is not None else _is_openrouter_model(target_llm)
+        if use_openrouter:
+            compat_base, compat_api_key = _resolve_openrouter_credentials(env_config, base_url)
+            compat_headers = _resolve_openrouter_headers(env_config)
+            if compat_headers:
+                client = openai.OpenAI(
+                    api_key=compat_api_key, base_url=compat_base, default_headers=compat_headers
+                )
+            else:
+                client = openai.OpenAI(api_key=compat_api_key, base_url=compat_base)
+        else:
+            compat_base, compat_api_key = _resolve_openai_compat_credentials(env_config, base_url)
+            client = openai.OpenAI(api_key=compat_api_key, base_url=compat_base)
         eval_batch_mode = _resolve_eval_batch_mode(env_config, batch_mode)
         chat_max_tokens = max_tokens
         if chat_max_tokens is None:
@@ -417,11 +563,15 @@ def main(
             else:
                 chat_max_tokens = int(env_config.get("eval_max_tokens", DEFAULT_MAX_TOKENS))
         if not compat_api_key:
+            if use_openrouter:
+                raise ValueError(
+                    "Missing OpenRouter API key. Set OPENROUTER_API_KEY "
+                    "or env.openrouter_api_key in config."
+                )
             raise ValueError(
                 "Missing API key for OpenAI-compatible evaluation. Set API_KEY/OPENAI_API_KEY "
                 "or env.openai_api_key in config."
             )
-        client = openai.OpenAI(api_key=compat_api_key, base_url=compat_base)
         if eval_batch_mode and not _openai_batch_supported(compat_base):
             logger.warning(
                 "Batch mode was requested but base_url is not https://api.openai.com/v1; "
@@ -430,8 +580,9 @@ def main(
             )
             eval_batch_mode = False
         logger.info(
-            f"OpenAI-compatible eval: base_url={compat_base or '[default OpenAI]'}, "
-            f"batch_mode={eval_batch_mode}, max_tokens={chat_max_tokens}"
+            f"OpenAI-compatible eval ({'OpenRouter' if use_openrouter else 'generic'}): "
+            f"base_url={compat_base or '[default OpenAI]'}, batch_mode={eval_batch_mode}, "
+            f"max_tokens={chat_max_tokens}"
         )
 
         request_id_list = []
@@ -504,16 +655,11 @@ def main(
                         messages=messages,
                         max_tokens=chat_max_tokens,
                     )
-                    content = _extract_text_from_response_payload(response)
+                body = _serialize_openai_payload(response)
+                content = _extract_text_from_response_payload(body)
                 info = {
                     "custom_id": request_id_list[idx],
-                    "response": {
-                        "body": {
-                            "choices": [
-                                {"message": {"content": content}}
-                            ]
-                        }
-                    },
+                    "response": {"body": body},
                 }
                 raw_message_list.append(info)
                 code = extract_code(content)
@@ -521,6 +667,7 @@ def main(
                     "item_id": idx,
                     "code": code
                 })
+            _log_response_diagnostics(raw_message_list)
             result = {
                 "raw_message_list": raw_message_list,
                 "code_message_list": code_message_list,
@@ -577,32 +724,45 @@ def main(
     result["eval_result"] = []
     
     logger.info(f"Evaluating {len(code_message_list)} test cases...")
-    # Temporarily save the result
     pkl_path = os.path.join(result_dir, f"llm_evaluation_{artifact_tag}.pkl")
-    _ensure_parent_dir(pkl_path)
-    with open(pkl_path, "wb") as file:
-        pickle.dump(result, file)
-    for item in code_message_list:
-        eval_item = {"result": None, "error": None}
-        item_id = item["item_id"]
-        code = item["code"]
-        if len(code) == 0:
-            eval_item["result"] = None
-            eval_item["error"] = "No code generated"
+    _persist_result(pkl_path, result)
+    last_completed_eval_idx = -1
+    try:
+        for idx, item in enumerate(code_message_list):
+            eval_item = {"result": None, "error": None}
+            item_id = item["item_id"]
+            code = item["code"]
+            if len(code) == 0:
+                eval_item["result"] = None
+                eval_item["error"] = "No code generated"
+                result["eval_result"].append(eval_item)
+                last_completed_eval_idx = idx
+                _persist_result(pkl_path, result)
+                continue
+            try:
+                code = code.replace("exit()", "") # We do not allow exit.
+                eval_result = stateful_bench.evaluate(item_id, code)
+                eval_item["result"] = eval_result
+            except KeyboardInterrupt:
+                raise
+            except BaseException:
+                # Keep evaluation alive even if generated code triggers SystemExit/BaseException.
+                error_info = traceback.format_exc()
+                eval_item["error"] = error_info
             result["eval_result"].append(eval_item)
-            continue
-        try:
-            code = code.replace("exit()", "") # We do not allow exit.
-            eval_result = stateful_bench.evaluate(item_id, code)
-            eval_item["result"] = eval_result
-        except Exception as e:
-            error_info = traceback.format_exc()
-            eval_item["error"] = error_info
-        result["eval_result"].append(eval_item)
-    
-    logger.info(f"Saving results to {pkl_path}")
-    with open(pkl_path, "wb") as file:
-        pickle.dump(result, file)
+            last_completed_eval_idx = idx
+            _persist_result(pkl_path, result)
+    except KeyboardInterrupt:
+        result["fatal_error"] = "KeyboardInterrupt"
+        logger.warning("Interrupted by user. Saving partial evaluation results.")
+        raise
+    except BaseException:
+        result["fatal_error"] = traceback.format_exc()
+        logger.exception("Fatal error during evaluation loop. Saving partial results.")
+    finally:
+        result["last_completed_eval_idx"] = last_completed_eval_idx
+        logger.info(f"Saving results to {pkl_path}")
+        _persist_result(pkl_path, result)
         
         
     
