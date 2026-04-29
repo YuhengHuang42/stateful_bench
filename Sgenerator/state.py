@@ -17,7 +17,9 @@ import json
 import ast
 import filelock
 import traceback
+import re
 from pathlib import Path
+
 from . import utils
 
 USER_FUNCTION_PARAM_FLAG = "user_variable"

@@ -1,6 +1,11 @@
 import json
 from pathlib import Path
-from typing import Annotated, Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
+
+try:
+    from typing import Annotated
+except ImportError:  # Python < 3.9
+    from typing_extensions import Annotated
 
 import typer
 import yaml
@@ -24,9 +29,69 @@ def _find_metadata(trace_dir: Path) -> dict:
         return json.load(fh)
 
 
-def _build_dataset_dict(trace_dir: Path, split: str) -> DatasetDict:
+def _load_agent_data_index(trace_dir: Path, agent_save_path: Optional[str]) -> Dict[str, dict]:
+    candidates = [trace_dir / "agent_data" / "agent_data.json"]
+    if agent_save_path:
+        candidates.append(Path(agent_save_path).expanduser().resolve() / "agent_data.json")
+    for candidate in candidates:
+        if candidate.exists():
+            with candidate.open("r") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                return {str(k): v for k, v in payload.items()}
+    return {}
+
+
+def _read_api_doc_text(repo_root: Path, api_doc_file: Optional[str]) -> str:
+    if not api_doc_file:
+        return ""
+    doc_path = (repo_root / api_doc_file).resolve()
+    if not doc_path.exists():
+        typer.echo(f"[WARN] api_doc_file not found at {doc_path}; metadata.doc will be empty.", err=True)
+        return ""
+    return doc_path.read_text()
+
+
+def _is_agent_conv_accepted(agent_conv: dict) -> bool:
+    structured = agent_conv.get("last_evaluator_structured")
+    if isinstance(structured, dict) and structured.get("verdict") == "ok":
+        return True
+    messages = agent_conv.get("evaluator_messages")
+    if not messages:
+        return False
+    last_msg = messages[-1] if isinstance(messages[-1], dict) else {}
+    content = (last_msg.get("content") or "").strip()
+    if "OK" in content:
+        return True
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("verdict") == "ok"
+
+
+def _extract_prompt_from_agent_conv(agent_conv: dict) -> str:
+    if not isinstance(agent_conv, dict) or not _is_agent_conv_accepted(agent_conv):
+        return ""
+    generator_messages = agent_conv.get("generator_messages")
+    if not isinstance(generator_messages, list) or not generator_messages:
+        return ""
+    for msg in reversed(generator_messages):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            return msg.get("content") or ""
+    return ""
+
+
+def _build_dataset_dict(
+    trace_dir: Path,
+    split: str,
+    metadata_payload: Optional[dict] = None,
+    agent_data_by_idx: Optional[Dict[str, dict]] = None,
+) -> DatasetDict:
     trace_dir = trace_dir.expanduser().resolve()
-    metadata_payload = _find_metadata(trace_dir)
+    if metadata_payload is None:
+        metadata_payload = _find_metadata(trace_dir)
+    agent_data_by_idx = agent_data_by_idx or {}
     # Separate prompt_book to avoid duplicating it across every row
     prompt_book = metadata_payload.get("prompt_book", {})
     metadata_wo_prompt = {k: v for k, v in metadata_payload.items() if k != "prompt_book"}
@@ -36,13 +101,19 @@ def _build_dataset_dict(trace_dir: Path, split: str) -> DatasetDict:
         idx = int(evaluator_file.stem.split("_")[1])
         with evaluator_file.open("r") as fh:
             evaluator_payload = json.load(fh)
+        agent_conv = agent_data_by_idx.get(str(idx))
         prompt = prompt_book.get(str(idx), "")
+        if not prompt and agent_conv is not None:
+            prompt = _extract_prompt_from_agent_conv(agent_conv)
         rows.append(
             {
                 "example_id": idx,
                 "evaluator_json": json.dumps(evaluator_payload, separators=(",", ":")),
                 "prompt": prompt,
                 "metadata_json": json.dumps(metadata_wo_prompt, separators=(",", ":")),
+                "agent_data_json": (
+                    json.dumps(agent_conv, separators=(",", ":")) if agent_conv is not None else ""
+                ),
             }
         )
     if not rows:
@@ -102,7 +173,26 @@ def bulk_pack(
             config = yaml.safe_load(fh)
         task = config.get("task", config_file.stem)
         trace_dir = Path(config["env"]["trace_save_path"])
-        dataset_dict = _build_dataset_dict(trace_dir, split)
+        agent_data_by_idx = _load_agent_data_index(trace_dir, config.get("env", {}).get("agent_save_path"))
+        try:
+            metadata_payload = _find_metadata(trace_dir)
+        except FileNotFoundError:
+            repo_root = Path(__file__).resolve().parent.parent
+            metadata_payload = {
+                "evaluation_config": {"base_url": config.get("env", {}).get("base_url")} if task == "session" else {},
+                "doc": _read_api_doc_text(repo_root, config.get("generation_config", {}).get("api_doc_file")),
+                "prompt_book": {},
+            }
+            typer.echo(
+                f"[WARN] No metadata file under {trace_dir}; building metadata from {config_file} and agent_data.json.",
+                err=True,
+            )
+        dataset_dict = _build_dataset_dict(
+            trace_dir=trace_dir,
+            split=split,
+            metadata_payload=metadata_payload,
+            agent_data_by_idx=agent_data_by_idx,
+        )
         dataset_name = config_file.stem
         output_dir = output_root / dataset_name if output_root else None
         repo_id = None
